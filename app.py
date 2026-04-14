@@ -549,30 +549,21 @@ tab_ov, tab_mh, tab_hmc, tab_cmp = st.tabs([
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_ov:
     st.title("Markov Chain Monte Carlo — Interactive Explorer")
+
+    # ── Top: quick orientation ─────────────────────────────────────────────────
     col_l, col_r = st.columns([2, 1])
     with col_l:
         st.markdown("""
-### Why MCMC?
+### What is MCMC?
 
-In Bayesian inference we often need samples from a posterior that we **cannot sample from directly**,
-but can evaluate pointwise up to a normalizing constant:
-""")
-        st.latex(r"\pi(\theta \mid y) \;\propto\; p(y \mid \theta)\;\cdot\;p(\theta)")
-        st.markdown("""
-**MCMC constructs a Markov chain whose stationary distribution is π.**
-After a *burn-in* period, the chain's positions are approximately distributed as π.
+**Markov Chain Monte Carlo** is a family of algorithms for drawing samples from
+probability distributions that are too complex to sample from directly.
+The samples can then be used to compute expectations, credible intervals,
+predictions — anything that requires integrating over the distribution.
 
----
-### Two algorithms
-
-| | Metropolis-Hastings | Hamiltonian Monte Carlo |
-|---|---|---|
-| **Proposal** | Random Gaussian jump | Gradient-guided leap via Hamiltonian dynamics |
-| **Mixing** | Slow (random walk) | Fast (directed exploration) |
-| **Needs** | log π(q) | log π(q) **and** ∇log π(q) |
-| **Key parameter** | proposal σ | step size ε, leapfrog steps L |
-
-Use the tabs above to step through each algorithm interactively.
+The core idea: construct a Markov chain whose **stationary distribution is exactly
+the target π**. Run the chain long enough and its states are, approximately,
+draws from π.
         """)
     with col_r:
         st.info("""
@@ -583,7 +574,6 @@ Use **Next ▶** to advance, **◀** to review.
 
 The **Comparison** tab lets you run both side-by-side.
         """)
-        st.markdown("---")
         st.markdown("""
 **Reading the diagnostics**
 
@@ -594,6 +584,113 @@ The **Comparison** tab lets you run both side-by-side.
 | ACF | Decays quickly to 0 |
 | Acceptance | MH: 20–50 % · HMC: 60–90 % |
         """)
+
+    st.divider()
+
+    # ── Bayesian vs Frequentist ────────────────────────────────────────────────
+    st.subheader("Bayesian vs. Frequentist inference")
+    bf_l, bf_m, bf_r = st.columns(3)
+
+    with bf_l:
+        st.markdown("#### Frequentist view")
+        st.markdown("""
+Parameters **θ** are fixed but unknown constants.
+Data **y** is the random quantity.
+
+Inference answers: *"If θ were equal to some null value, how surprising would this data be?"*
+
+Tools: p-values, confidence intervals, maximum likelihood estimates (MLEs).
+
+A **95% confidence interval** means: if we repeated the experiment many times, 95% of the intervals constructed this way would contain the true θ. It says nothing about the probability that *this particular* interval contains θ.
+        """)
+
+    with bf_m:
+        st.markdown("#### Bayesian view")
+        st.markdown("""
+Parameters **θ** are treated as **random variables** with their own distributions, representing uncertainty.
+
+Inference answers: *"Given the data I observed, what should I now believe about θ?"*
+
+This is formalised via **Bayes' theorem**:
+        """)
+        st.latex(r"\underbrace{p(\theta \mid y)}_{\text{posterior}} \;\propto\; \underbrace{p(y \mid \theta)}_{\text{likelihood}} \;\cdot\; \underbrace{p(\theta)}_{\text{prior}}")
+        st.markdown("""
+A **95% credible interval** directly means: given the data, there is a 95% probability that θ lies in this interval. The interpretation is more natural.
+        """)
+
+    with bf_r:
+        st.markdown("#### Where MCMC comes in")
+        st.markdown("""
+The posterior is often known only up to its normalizing constant:
+        """)
+        st.latex(r"p(\theta \mid y) = \frac{p(y \mid \theta)\,p(\theta)}{\int p(y \mid \theta)\,p(\theta)\,d\theta}")
+        st.markdown("""
+The denominator — the **marginal likelihood** — requires integrating over all possible parameter values. For models with more than a handful of parameters this integral is intractable.
+
+**MCMC sidesteps this entirely.** It only needs to evaluate the *unnormalized* numerator pointwise, and constructs a chain that samples from the posterior without ever computing the integral.
+        """)
+
+    st.divider()
+
+    # ── Motivating examples ────────────────────────────────────────────────────
+    st.subheader("Where is this actually used?")
+    ex1, ex2, ex3 = st.columns(3)
+
+    with ex1:
+        st.markdown("#### Clinical trials")
+        st.markdown("""
+A drug trial records whether each patient responded to treatment. We want to estimate the true response rate θ and quantify uncertainty about it.
+
+**Frequentist**: compute a point estimate θ̂ = successes/n and a confidence interval from the normal approximation.
+
+**Bayesian**: place a Beta(1,1) prior on θ (uniform over [0,1]), observe the data, and obtain a Beta(1+successes, 1+failures) posterior. MCMC becomes essential when the likelihood involves multiple interacting parameters (e.g. adjusting for covariates in a logistic regression).
+
+The posterior gives a full probability distribution over plausible effect sizes — not just a single number — which is often more useful for clinical decision-making.
+        """)
+
+    with ex2:
+        st.markdown("#### Hierarchical models")
+        st.markdown("""
+Many datasets have **grouped structure**: students within schools, patients within hospitals, measurements within experiments. A hierarchical model pools information across groups while still estimating group-specific effects.
+
+For example, estimating school-level test score effects while sharing strength across all schools:
+        """)
+        st.latex(r"""\mu_j \sim \mathcal{N}(\mu, \sigma^2_\mu), \quad
+y_{ij} \sim \mathcal{N}(\mu_j, \sigma^2_e)""")
+        st.markdown("""
+The posterior over all school means {μⱼ}, the global mean μ, and variance components has no closed form — even with Gaussian likelihoods the coupling between parameters makes direct sampling impossible. MCMC is the standard tool.
+        """)
+
+    with ex3:
+        st.markdown("#### Physics & statistical mechanics")
+        st.markdown("""
+In statistical mechanics, the equilibrium distribution of a physical system at temperature T follows the **Boltzmann distribution**:
+        """)
+        st.latex(r"p(\mathbf{x}) \propto \exp\!\left(-\frac{E(\mathbf{x})}{k_B T}\right)")
+        st.markdown("""
+where **x** is the system's configuration (e.g. atomic positions) and E is its energy.
+
+Computing macroscopic properties (pressure, heat capacity, phase transitions) requires averaging over this distribution. With 10²³ particles the state space is astronomically large — direct integration is hopeless.
+
+The Metropolis algorithm was invented precisely for this problem (Metropolis et al., 1953) and HMC grew from molecular dynamics simulations. Both are still heavily used in computational chemistry and lattice QCD.
+        """)
+
+    st.divider()
+
+    # ── Algorithm comparison ───────────────────────────────────────────────────
+    st.subheader("The two algorithms in this app")
+    st.markdown("""
+| | Metropolis-Hastings | Hamiltonian Monte Carlo |
+|---|---|---|
+| **Proposal** | Random Gaussian jump | Gradient-guided leap via Hamiltonian dynamics |
+| **Mixing speed** | Slow — random walk scaling O(d²) | Fast — can traverse the space in O(d) steps |
+| **What it needs** | log π(q) only | log π(q) **and** ∇log π(q) |
+| **Key tuning** | Proposal width σ | Step size ε, leapfrog steps L |
+| **Acceptance rate** | Target ~23–50 % | Target ~60–90 % |
+| **Historical origin** | Metropolis et al. (1953) for nuclear physics | Duane et al. (1987) for lattice QCD |
+
+Use the tabs above to step through each algorithm interactively.
+    """)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # METROPOLIS-HASTINGS TAB
