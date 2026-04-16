@@ -532,7 +532,7 @@ def step_nav(key, labels):
 
 # ── Session state init ────────────────────────────────────────────────────────
 
-for _k in ("mh_step", "hmc_step", "mh_res", "hmc_res"):
+for _k in ("ov_step", "mh_step", "hmc_step", "mh_res", "hmc_res"):
     if _k not in st.session_state:
         st.session_state[_k] = None if _k.endswith("res") else 0
 
@@ -550,32 +550,75 @@ tab_ov, tab_mh, tab_hmc, tab_cmp = st.tabs([
 with tab_ov:
     st.title("Markov Chain Monte Carlo — Interactive Explorer")
 
-    # ── Top: quick orientation ─────────────────────────────────────────────────
-    col_l, col_r = st.columns([2, 1])
-    with col_l:
-        st.markdown("""
-### What is MCMC?
+    OV_LABELS = [
+        "The core problem",
+        "Bayesian inference",
+        "A worked example",
+        "Where it's used",
+        "The two algorithms",
+    ]
+    ov_step = step_nav("ov_step", OV_LABELS)
 
-**Markov Chain Monte Carlo** is a family of algorithms for drawing samples from
-probability distributions that are too complex to sample from directly.
-The samples can then be used to compute expectations, credible intervals,
-predictions — anything that requires integrating over the distribution.
+    # ── Step 0: The core problem ───────────────────────────────────────────────
+    if ov_step == 0:
+        col_l, col_r = st.columns([1, 1])
+        with col_l:
+            st.markdown("## The core problem")
+            st.markdown("""
+Many problems in statistics, physics, and machine learning reduce to computing **expectations** under a probability distribution π:
+""")
+            st.latex(r"\mathbb{E}_{\theta \sim \pi}[f(\theta)] = \int f(\theta)\,\pi(\theta)\,d\theta")
+            st.markdown("""
+This integral rarely has a closed form. And even numerically, it becomes **exponentially harder** as the number of dimensions grows — with 50 parameters and a 10-point grid per dimension you'd need 10⁵⁰ evaluations.
 
-The core idea: construct a Markov chain whose **stationary distribution is exactly
-the target π**. Run the chain long enough and its states are, approximately,
-draws from π.
-        """)
-    with col_r:
-        st.info("""
-**How to use this app**
+**Monte Carlo** sidesteps this with samples: draw θ₁, …, θ_N ~ π and use the average:
+""")
+            st.latex(r"\mathbb{E}[f(\theta)] \;\approx\; \frac{1}{N}\sum_{i=1}^{N} f(\theta_i)")
+            st.markdown("""
+The error is **O(1/√N)** — independent of dimension. The catch: how do you *draw* samples from π when π is complex and high-dimensional?
 
-Each algorithm tab walks you through the idea **one concept at a time**.
-Use **Next ▶** to advance, **◀** to review.
+If you can write down π directly (e.g. a Gaussian), you can sample it analytically. But for most real models — Bayesian posteriors, Boltzmann distributions, latent variable models — you cannot. You only know π **up to a normalizing constant**:
+""")
+            st.latex(r"\pi(\theta) = \frac{\tilde\pi(\theta)}{Z}, \qquad Z = \int \tilde\pi(\theta)\,d\theta \text{ unknown}")
+            st.markdown("""
+**MCMC** is the answer: construct a Markov chain that is *easy to simulate* and whose stationary distribution is *exactly π*, without ever computing Z.
+""")
+            st.info("Click **Next ▶** to see how Bayesian inference creates this exact situation.")
+        with col_r:
+            # Illustrate the curse of dimensionality + Monte Carlo convergence
+            rng_ov = np.random.default_rng(7)
+            ns = [10, 50, 200, 1000, 5000]
+            errs = []
+            for n in ns:
+                s = rng_ov.standard_normal((200, n))
+                mc_est = np.mean(np.abs(s), axis=1)   # E[|X|] for N(0,1) = sqrt(2/pi)
+                errs.append(float(np.std(mc_est)))
+            true_val = np.sqrt(2.0 / np.pi)
+            xs_cod = np.linspace(5, 6000, 300)
 
-The **Comparison** tab lets you run both side-by-side.
-        """)
-        st.markdown("""
-**Reading the diagnostics**
+            fig_cod = go.Figure()
+            fig_cod.add_trace(go.Scatter(
+                x=xs_cod, y=1.0 / np.sqrt(xs_cod),
+                mode="lines", line=dict(color=C_GREEN, width=2.5, dash="dash"),
+                name="O(1/√N) theory",
+            ))
+            fig_cod.add_trace(go.Scatter(
+                x=ns, y=errs, mode="markers+lines",
+                marker=dict(size=10, color=C_BLUE),
+                line=dict(color=C_BLUE, width=2),
+                name="MC error (empirical)",
+            ))
+            fig_cod.update_layout(
+                title="Monte Carlo error decays as O(1/√N) — independent of dimension",
+                xaxis_title="Number of samples N",
+                yaxis_title="Std. error of estimate",
+                height=360, margin=dict(t=70, b=30),
+                legend=dict(x=0.45, y=0.95),
+            )
+            st.plotly_chart(fig_cod, use_container_width=True)
+
+            st.info("""
+**Reading the diagnostics** (used throughout the app)
 
 | | Good sign |
 |---|---|
@@ -583,103 +626,242 @@ The **Comparison** tab lets you run both side-by-side.
 | Histogram | Matches green density |
 | ACF | Decays quickly to 0 |
 | Acceptance | MH: 20–50 % · HMC: 60–90 % |
-        """)
+""")
 
-    st.divider()
+    # ── Step 1: Bayesian inference ─────────────────────────────────────────────
+    elif ov_step == 1:
+        col_l, col_m, col_r = st.columns(3)
 
-    # ── Bayesian vs Frequentist ────────────────────────────────────────────────
-    st.subheader("Bayesian vs. Frequentist inference")
-    bf_l, bf_m, bf_r = st.columns(3)
+        with col_l:
+            st.markdown("#### Frequentist view")
+            st.markdown("""
+Parameters **θ** are fixed but unknown constants. Data **y** is the random quantity.
 
-    with bf_l:
-        st.markdown("#### Frequentist view")
+Inference answers: *"If θ equalled some null value, how surprising would this data be?"*
+
+Tools: p-values, confidence intervals, maximum-likelihood estimates (MLEs).
+
+A **95% confidence interval** means: if we repeated the experiment many times, 95% of the constructed intervals would contain the true θ. It says nothing about the probability that *this particular* interval contains θ.
+""")
+
+        with col_m:
+            st.markdown("#### Bayesian view")
+            st.markdown("""
+Parameters **θ** are treated as random variables. Inference answers: *"Given the data I observed, what should I believe about θ?"*
+
+Formalised by **Bayes' theorem**:
+""")
+            st.latex(r"\underbrace{p(\theta \mid y)}_{\text{posterior}} \;\propto\; \underbrace{p(y \mid \theta)}_{\text{likelihood}} \;\cdot\; \underbrace{p(\theta)}_{\text{prior}}")
+            st.markdown("""
+A **95% credible interval** directly means: given the data, there is a 95% probability that θ lies in this interval.
+
+The full posterior is useful for predictions, decisions, and propagating uncertainty downstream.
+""")
+
+        with col_r:
+            st.markdown("#### Where MCMC enters")
+            st.markdown("""
+The exact posterior requires the normalizing constant:
+""")
+            st.latex(r"p(\theta \mid y) = \frac{p(y \mid \theta)\,p(\theta)}{\underbrace{\int p(y \mid \theta)\,p(\theta)\,d\theta}_{Z \;=\; \text{intractable}}}")
+            st.markdown("""
+For most real models Z has **no closed form** — and numerical quadrature fails once the parameter space has more than ~4 dimensions.
+
+**MCMC only needs the numerator** — the unnormalized product p(y|θ)·p(θ) — evaluated pointwise. The chain is designed to explore θ-space proportionally to this product, automatically giving samples from the posterior.
+
+→ Step 3 shows a concrete model where this is necessary.
+""")
+
+    # ── Step 2: Worked example — Bayesian logistic regression ─────────────────
+    elif ov_step == 2:
+        st.markdown("## A concrete example: Bayesian logistic regression")
         st.markdown("""
-Parameters **θ** are fixed but unknown constants.
-Data **y** is the random quantity.
+Here is the simplest model where you **provably need MCMC** (or a similar method).
 
-Inference answers: *"If θ were equal to some null value, how surprising would this data be?"*
-
-Tools: p-values, confidence intervals, maximum likelihood estimates (MLEs).
-
-A **95% confidence interval** means: if we repeated the experiment many times, 95% of the intervals constructed this way would contain the true θ. It says nothing about the probability that *this particular* interval contains θ.
-        """)
-
-    with bf_m:
-        st.markdown("#### Bayesian view")
+**Setup**: 12 students studied for between 0 and 10 hours. Did they pass?
+We model the pass probability with a logistic curve:
+""")
+        st.latex(r"P(\text{pass} \mid x, \beta_0, \beta_1) = \sigma(\beta_0 + \beta_1 x), \qquad \sigma(z) = \frac{1}{1+e^{-z}}")
         st.markdown("""
-Parameters **θ** are treated as **random variables** with their own distributions, representing uncertainty.
+We put a gentle prior on the coefficients: β₀, β₁ ~ N(0, 2²).
 
-Inference answers: *"Given the data I observed, what should I now believe about θ?"*
+The **posterior** is:
+""")
+        st.latex(r"p(\beta_0, \beta_1 \mid \text{data}) \;\propto\; \underbrace{\prod_{i=1}^{n} \sigma(\beta_0+\beta_1 x_i)^{y_i}(1-\sigma(\beta_0+\beta_1 x_i))^{1-y_i}}_{\text{likelihood}} \cdot \underbrace{e^{-(\beta_0^2+\beta_1^2)/8}}_{\text{prior}}")
 
-This is formalised via **Bayes' theorem**:
-        """)
-        st.latex(r"\underbrace{p(\theta \mid y)}_{\text{posterior}} \;\propto\; \underbrace{p(y \mid \theta)}_{\text{likelihood}} \;\cdot\; \underbrace{p(\theta)}_{\text{prior}}")
-        st.markdown("""
-A **95% credible interval** directly means: given the data, there is a 95% probability that θ lies in this interval. The interpretation is more natural.
-        """)
+        # Fixed dataset
+        x_data = np.array([0.5, 1.0, 2.0, 2.5, 3.5, 4.0, 5.0, 6.0, 7.0, 7.5, 9.0, 10.0])
+        y_data = np.array([0,   0,   0,   1,   0,   1,   1,   0,   1,   1,   1,   1  ])
 
-    with bf_r:
-        st.markdown("#### Where MCMC comes in")
-        st.markdown("""
-The posterior is often known only up to its normalizing constant:
-        """)
-        st.latex(r"p(\theta \mid y) = \frac{p(y \mid \theta)\,p(\theta)}{\int p(y \mid \theta)\,p(\theta)\,d\theta}")
-        st.markdown("""
-The denominator — the **marginal likelihood** — requires integrating over all possible parameter values. For models with more than a handful of parameters this integral is intractable.
+        def log_posterior_logreg(b0, b1):
+            z = b0 + b1 * x_data
+            z = np.clip(z, -30, 30)
+            log_lik = np.sum(y_data * (-np.log1p(np.exp(-z)))
+                             + (1 - y_data) * (-np.log1p(np.exp(z))))
+            log_prior = -0.5 * (b0**2 + b1**2) / 4.0
+            return log_lik + log_prior
 
-**MCMC sidesteps this entirely.** It only needs to evaluate the *unnormalized* numerator pointwise, and constructs a chain that samples from the posterior without ever computing the integral.
-        """)
+        b0_grid = np.linspace(-4, 4, 180)
+        b1_grid = np.linspace(-0.5, 2.5, 180)
+        B0, B1 = np.meshgrid(b0_grid, b1_grid)
+        log_post = np.array([[log_posterior_logreg(b0, b1)
+                               for b0 in b0_grid] for b1 in b1_grid])
+        log_post -= log_post.max()
 
-    st.divider()
+        col_l, col_r = st.columns([1, 1])
+        with col_l:
+            fig_data = go.Figure()
+            x_curve = np.linspace(0, 10.5, 200)
+            # MLE (rough) for the curve — use the posterior mode region
+            best_idx = np.unravel_index(log_post.argmax(), log_post.shape)
+            b0_mode = float(b0_grid[best_idx[1]])
+            b1_mode = float(b1_grid[best_idx[0]])
+            p_curve = 1.0 / (1.0 + np.exp(-(b0_mode + b1_mode * x_curve)))
 
-    # ── Motivating examples ────────────────────────────────────────────────────
-    st.subheader("Where is this actually used?")
-    ex1, ex2, ex3 = st.columns(3)
+            fig_data.add_trace(go.Scatter(
+                x=x_data[y_data == 0], y=y_data[y_data == 0],
+                mode="markers", marker=dict(size=14, color=C_RED, symbol="circle"),
+                name="Fail (y=0)",
+            ))
+            fig_data.add_trace(go.Scatter(
+                x=x_data[y_data == 1], y=y_data[y_data == 1],
+                mode="markers", marker=dict(size=14, color=C_GREEN, symbol="circle"),
+                name="Pass (y=1)",
+            ))
+            fig_data.add_trace(go.Scatter(
+                x=x_curve, y=p_curve, mode="lines",
+                line=dict(color=C_BLUE, width=2.5),
+                name="Posterior-mode fit",
+            ))
+            fig_data.update_layout(
+                title="The data: study hours vs. pass/fail",
+                xaxis_title="Hours studied (x)",
+                yaxis=dict(title="P(pass)", range=[-0.08, 1.08],
+                           tickvals=[0, 0.5, 1], ticktext=["0 (Fail)", "0.5", "1 (Pass)"]),
+                height=340, margin=dict(t=60, b=30),
+                legend=dict(x=0.02, y=0.95),
+            )
+            st.plotly_chart(fig_data, use_container_width=True)
 
-    with ex1:
-        st.markdown("#### Clinical trials")
-        st.markdown("""
-A drug trial records whether each patient responded to treatment. We want to estimate the true response rate θ and quantify uncertainty about it.
+            st.markdown("""
+**Why can't we just integrate?**
 
-**Frequentist**: compute a point estimate θ̂ = successes/n and a confidence interval from the normal approximation.
+The posterior over (β₀, β₁) involves a product of logistic functions. There is no formula for the integral — not even in 2D. The normalizing constant Z = ∫∫ p(data|β)·p(β) dβ₀ dβ₁ must be computed numerically, and in higher-dimensional models this becomes completely infeasible.
 
-**Bayesian**: place a Beta(1,1) prior on θ (uniform over [0,1]), observe the data, and obtain a Beta(1+successes, 1+failures) posterior. MCMC becomes essential when the likelihood involves multiple interacting parameters (e.g. adjusting for covariates in a logistic regression).
+MCMC draws samples from this posterior **without computing Z**.
+""")
 
-The posterior gives a full probability distribution over plausible effect sizes — not just a single number — which is often more useful for clinical decision-making.
-        """)
+        with col_r:
+            fig_post = go.Figure()
+            fig_post.add_trace(go.Contour(
+                x=b0_grid, y=b1_grid, z=np.exp(log_post),
+                colorscale="Blues",
+                contours=dict(showlabels=False),
+                colorbar=dict(title="unnorm. posterior", len=0.6),
+                name="Posterior",
+            ))
+            fig_post.update_layout(
+                title="Unnormalized posterior p(β₀, β₁ | data)",
+                xaxis_title="β₀  (intercept)",
+                yaxis_title="β₁  (slope)",
+                height=340, margin=dict(t=60, b=30),
+            )
+            st.plotly_chart(fig_post, use_container_width=True)
 
-    with ex2:
-        st.markdown("#### Hierarchical models")
-        st.markdown("""
-Many datasets have **grouped structure**: students within schools, patients within hospitals, measurements within experiments. A hierarchical model pools information across groups while still estimating group-specific effects.
+            st.markdown("""
+**What MCMC gives you**
 
-For example, estimating school-level test score effects while sharing strength across all schools:
-        """)
-        st.latex(r"""\mu_j \sim \mathcal{N}(\mu, \sigma^2_\mu), \quad
+Once you have samples (β₀⁽ⁱ⁾, β₁⁽ⁱ⁾) from the posterior you can:
+
+- Compute a **credible interval** for the probability of passing at 5 hours:
+  just evaluate σ(β₀⁽ⁱ⁾ + 5β₁⁽ⁱ⁾) for each sample and report the 2.5–97.5 percentile range
+- Answer *"given this dataset, is there a >90% chance a student who studies 8 hours passes?"*
+- Propagate uncertainty into any downstream decision
+
+None of this requires knowing Z.
+""")
+
+    # ── Step 3: Where it's used ────────────────────────────────────────────────
+    elif ov_step == 3:
+        st.markdown("## Where is this actually used?")
+        ex1, ex2, ex3 = st.columns(3)
+
+        with ex1:
+            st.markdown("#### Clinical trials")
+            st.markdown("""
+A drug trial records whether each patient responded to treatment. We want to estimate the true response rate θ and quantify uncertainty.
+
+**Simple case** (single rate): prior Beta(1,1), posterior Beta(1+successes, 1+failures) — has a closed form, no MCMC needed.
+
+**Realistic case**: adjust for covariates (age, weight, dose) via logistic regression. The posterior over all regression coefficients has no closed form → MCMC.
+
+The posterior gives a **full distribution over plausible effect sizes**, not just a point estimate, which is more useful for clinical decisions.
+""")
+
+        with ex2:
+            st.markdown("#### Hierarchical models")
+            st.markdown("""
+Many datasets have **grouped structure**: students within schools, patients within hospitals. A hierarchical model pools information while estimating group-specific effects.
+""")
+            st.latex(r"""\mu_j \sim \mathcal{N}(\mu, \sigma^2_\mu), \quad
 y_{ij} \sim \mathcal{N}(\mu_j, \sigma^2_e)""")
-        st.markdown("""
-The posterior over all school means {μⱼ}, the global mean μ, and variance components has no closed form — even with Gaussian likelihoods the coupling between parameters makes direct sampling impossible. MCMC is the standard tool.
-        """)
+            st.markdown("""
+The posterior over all school means {μⱼ}, global mean μ, and variance components has no closed form — the coupling between parameters makes direct sampling impossible even with Gaussian likelihoods.
 
-    with ex3:
-        st.markdown("#### Physics & statistical mechanics")
-        st.markdown("""
-In statistical mechanics, the equilibrium distribution of a physical system at temperature T follows the **Boltzmann distribution**:
-        """)
-        st.latex(r"p(\mathbf{x}) \propto \exp\!\left(-\frac{E(\mathbf{x})}{k_B T}\right)")
-        st.markdown("""
+This is one of the most common uses of MCMC in social science, educational research, and medicine.
+""")
+
+        with ex3:
+            st.markdown("#### Physics & statistical mechanics")
+            st.markdown("""
+Equilibrium distributions follow the **Boltzmann distribution**:
+""")
+            st.latex(r"p(\mathbf{x}) \propto \exp\!\left(-\frac{E(\mathbf{x})}{k_B T}\right)")
+            st.markdown("""
 where **x** is the system's configuration (e.g. atomic positions) and E is its energy.
 
-Computing macroscopic properties (pressure, heat capacity, phase transitions) requires averaging over this distribution. With 10²³ particles the state space is astronomically large — direct integration is hopeless.
+Computing macroscopic properties (pressure, phase transitions) requires averaging over this. With 10²³ particles direct integration is hopeless.
 
-The Metropolis algorithm was invented precisely for this problem (Metropolis et al., 1953) and HMC grew from molecular dynamics simulations. Both are still heavily used in computational chemistry and lattice QCD.
-        """)
+The Metropolis algorithm was invented for exactly this (Metropolis et al., 1953). HMC grew from molecular dynamics. Both are still heavily used in computational chemistry and lattice QCD today.
+""")
 
-    st.divider()
+    # ── Step 4: The two algorithms ─────────────────────────────────────────────
+    elif ov_step == 4:
+        st.markdown("## The two algorithms in this app")
+        col_l, col_r = st.columns([1, 1])
 
-    # ── Algorithm comparison ───────────────────────────────────────────────────
-    st.subheader("The two algorithms in this app")
-    st.markdown("""
+        with col_l:
+            st.markdown("#### Metropolis-Hastings")
+            st.markdown("""
+The simplest MCMC algorithm. From the current position q:
+
+1. **Propose** q* ~ N(q, σ²)
+2. **Accept** with probability min(1, π(q*)/π(q))
+3. Move to q* if accepted, stay at q otherwise
+
+The chain drifts toward high-density regions because uphill moves are always accepted; downhill moves are only sometimes accepted.
+
+**Drawback**: it moves by a random walk, so to travel a distance d it takes O(d²) steps. For complex posteriors this is very slow.
+""")
+            st.info("→ Metropolis-Hastings tab walks through this step-by-step.")
+
+        with col_r:
+            st.markdown("#### Hamiltonian Monte Carlo")
+            st.markdown("""
+A smarter algorithm that uses the **gradient** of log π to make long, directed proposals:
+
+1. Draw auxiliary momentum **p ~ N(0,1)**
+2. Run L **leapfrog steps** (a symplectic ODE integrator) to propose (q*, p*)
+3. Accept with min(1, exp(−ΔH)) — usually near 100%
+
+The leapfrog integrator conserves the Hamiltonian H = U(q) + K(p), so proposals travel far along the density surface without random-walk diffusion.
+
+**Why leapfrog?** It's *symplectic* — it keeps energy error bounded for all time. Euler's method drifts and causes proposals to be rejected.
+""")
+            st.info("→ HMC & Leapfrog tab walks through this step-by-step.")
+
+        st.divider()
+        st.markdown("""
 | | Metropolis-Hastings | Hamiltonian Monte Carlo |
 |---|---|---|
 | **Proposal** | Random Gaussian jump | Gradient-guided leap via Hamiltonian dynamics |
@@ -689,8 +871,8 @@ The Metropolis algorithm was invented precisely for this problem (Metropolis et 
 | **Acceptance rate** | Target ~23–50 % | Target ~60–90 % |
 | **Historical origin** | Metropolis et al. (1953) for nuclear physics | Duane et al. (1987) for lattice QCD |
 
-Use the tabs above to step through each algorithm interactively.
-    """)
+Use the tabs above to step through each algorithm interactively, then compare them head-to-head in the **Comparison** tab.
+""")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # METROPOLIS-HASTINGS TAB
