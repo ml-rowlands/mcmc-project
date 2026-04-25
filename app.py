@@ -9,6 +9,14 @@ import scipy.stats as stats
 from scipy.special import logsumexp
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import pandas as pd
+import os, io, warnings
+
+import ppl as _ppl
 
 st.set_page_config(page_title="MCMC Explorer", page_icon="⛓", layout="wide")
 
@@ -532,16 +540,18 @@ def step_nav(key, labels):
 
 # ── Session state init ────────────────────────────────────────────────────────
 
-for _k in ("ov_step", "mh_step", "hmc_step", "mh_res", "hmc_res"):
+for _k in ("ov_step", "mh_step", "hmc_step", "ppl_step", "mh_res", "hmc_res",
+           "ppl_samples", "glacier_ppl_res", "glacier_pymc_res"):
     if _k not in st.session_state:
-        st.session_state[_k] = None if _k.endswith("res") else 0
+        st.session_state[_k] = None if _k.endswith(("res", "samples")) else 0
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab_ov, tab_mh, tab_hmc, tab_cmp = st.tabs([
-    "Overview", "Metropolis-Hastings", "HMC & Leapfrog", "Comparison"
+tab_ov, tab_mh, tab_hmc, tab_cmp, tab_ppl, tab_glacier = st.tabs([
+    "Overview", "Metropolis-Hastings", "HMC & Leapfrog", "Comparison",
+    "🔧 Build a PPL", "🏔 Glacier Case Study",
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1451,3 +1461,1056 @@ The **ACF overlay** at the bottom is the key diagnostic: faster decay → better
             st.plotly_chart(fig_acf, use_container_width=True)
         else:
             st.info("Configure both samplers and click **Run comparison**.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILD A PPL TAB
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_ppl:
+    st.header("Build a Probabilistic Programming Language from Scratch")
+    st.markdown("""
+We'll construct a minimal PPL step-by-step — distributions, variable nodes,
+a model graph, and an MCMC sampler — then run it on a realistic hierarchical model.
+All code lives in **`ppl.py`** alongside this app.
+""")
+
+    PPL_LABELS = [
+        "Distributions",
+        "Variable nodes & Model",
+        "Metropolis sampler",
+        "HMC in the PPL",
+        "Random effects demo",
+    ]
+    ppl_step = step_nav("ppl_step", PPL_LABELS)
+
+    # ── PPL Step 0: Distributions ──────────────────────────────────────────────
+    if ppl_step == 0:
+        L, R = st.columns([1, 1])
+        with L:
+            st.markdown("## Distributions")
+            st.markdown("""
+Every variable in a probabilistic model has a **distribution** — a
+probability density that tells us how plausible each value is.
+In our PPL, each distribution class just needs one method: `log_prob(x)`.
+
+We use **log**-probabilities everywhere because:
+- They avoid numerical underflow with products of small probabilities
+- They turn products (joint distributions) into sums
+- MCMC only needs *differences* of log-probabilities, so constants cancel
+""")
+            st.code("""\
+import scipy.stats as sp
+import numpy as np
+
+class Normal:
+    def __init__(self, mean=0.0, std=1.0):
+        self.mean = mean   # can be a callable for linking
+        self.std  = std
+
+    def log_prob(self, x):
+        mean = self.mean() if callable(self.mean) else self.mean
+        std  = self.std()  if callable(self.std)  else self.std
+        return float(sp.norm.logpdf(x, mean, std))
+
+class HalfNormal:          # positive-only — great prior for variances
+    def __init__(self, scale=1.0):
+        self.scale = scale
+    def log_prob(self, x):
+        if x < 0: return -np.inf
+        return float(sp.halfnorm.logpdf(x, scale=self.scale))
+
+class Gamma:               # rate parameterisation: scale = 1/beta
+    def __init__(self, alpha=1.0, beta=1.0):
+        self.alpha = alpha; self.beta = beta
+    def log_prob(self, x):
+        if x <= 0: return -np.inf
+        return float(sp.gamma.logpdf(x, a=self.alpha, scale=1/self.beta))
+
+class Beta:                # supported on (0, 1)
+    def __init__(self, alpha=1.0, beta=1.0):
+        self.alpha = alpha; self.beta = beta
+    def log_prob(self, x):
+        if x <= 0 or x >= 1: return -np.inf
+        return float(sp.beta.logpdf(x, self.alpha, self.beta))
+""", language="python")
+
+        with R:
+            st.markdown("### Interactive: explore the distributions")
+            dist_choice = st.selectbox("Distribution", ["Normal", "HalfNormal", "Gamma", "Beta"],
+                                       key="ppl_dist")
+            xs_d = np.linspace(-5, 5, 400)
+            if dist_choice == "Normal":
+                mn = st.slider("mean", -3.0, 3.0, 0.0, 0.1, key="ppl_mn")
+                sd = st.slider("std",   0.1, 3.0, 1.0, 0.1, key="ppl_sd")
+                xs_d = np.linspace(mn - 4*sd, mn + 4*sd, 400)
+                dist_obj = _ppl.Normal(mn, sd)
+            elif dist_choice == "HalfNormal":
+                sc = st.slider("scale", 0.2, 3.0, 1.0, 0.1, key="ppl_sc")
+                xs_d = np.linspace(0, sc*4, 400)
+                dist_obj = _ppl.HalfNormal(sc)
+            elif dist_choice == "Gamma":
+                al = st.slider("alpha (shape)", 0.5, 8.0, 2.0, 0.5, key="ppl_al")
+                be = st.slider("beta (rate)",   0.2, 5.0, 1.0, 0.2, key="ppl_be")
+                xs_d = np.linspace(0.01, al/be + 5*np.sqrt(al)/be, 400)
+                dist_obj = _ppl.Gamma(al, be)
+            else:  # Beta
+                a2 = st.slider("alpha", 0.5, 8.0, 2.0, 0.5, key="ppl_a2")
+                b2 = st.slider("beta",  0.5, 8.0, 5.0, 0.5, key="ppl_b2")
+                xs_d = np.linspace(0.001, 0.999, 400)
+                dist_obj = _ppl.Beta(a2, b2)
+
+            lps = np.array([dist_obj.log_prob(x) for x in xs_d])
+            pd_vals = np.exp(np.where(np.isfinite(lps), lps, -30))
+
+            fig_dp = go.Figure()
+            fig_dp.add_trace(go.Scatter(x=xs_d, y=pd_vals, fill="tozeroy", mode="none",
+                                        fillcolor="rgba(99,110,250,0.15)", showlegend=False))
+            fig_dp.add_trace(go.Scatter(x=xs_d, y=pd_vals, mode="lines",
+                                        line=dict(color=C_BLUE, width=2.5), name=dist_choice))
+            fig_dp.update_layout(title=f"{dist_choice} PDF", xaxis_title="x",
+                                  yaxis_title="density", height=340,
+                                  margin=dict(t=50, b=20))
+            st.plotly_chart(fig_dp, use_container_width=True)
+
+            st.markdown(f"**log_prob at x = 0.5:** `{dist_obj.log_prob(0.5):.4f}`")
+            st.info("Click **Next ▶** to see how distributions attach to variables in a model graph.")
+
+    # ── PPL Step 1: Variable nodes & Model ────────────────────────────────────
+    elif ppl_step == 1:
+        L, R = st.columns([1, 1])
+        with L:
+            st.markdown("## Variable nodes & the Model graph")
+            st.markdown("""
+A **Variable** is a named node in the graph. It stores:
+- which distribution it was drawn from
+- its parent nodes (dependencies)
+- whether it's **observed** (data — fixed value) or **latent** (unknown)
+
+A **Deterministic** node is a pure function of parents — it has no log_prob
+contribution, it just computes a derived quantity.
+
+The **Model** class stitches nodes together and can evaluate the
+**joint log-probability** — the sum of all node log-probs in topological order.
+This is the core quantity MCMC needs; the normalising constant never appears.
+""")
+            st.code("""\
+class Variable:
+    def __init__(self, name, dist, parents=None,
+                 observed=False, observed_data=None):
+        self.name          = name
+        self.dist          = dist
+        self.parents       = parents or []
+        self.observed      = observed
+        self.value         = observed_data
+        self.deterministic = isinstance(dist, Deterministic)
+
+class Model:
+    def __init__(self):
+        self.variables = {}
+
+    def add_variable(self, name, dist, parents=None,
+                     observed=False, observed_data=None):
+        var = Variable(name, dist, parents, observed, observed_data)
+        self.variables[name] = var
+        return var
+
+    def add_deterministic(self, name, fn, parents):
+        var = Variable(name, Deterministic(fn), parents=parents)
+        self.variables[name] = var
+        return var
+
+    def log_prob(self, state: dict) -> float:
+        logp = 0.0
+        for var in self._topological_sort():
+            if var.deterministic:
+                var.value = var.dist.evaluate()
+            else:
+                if not var.observed:
+                    var.value = state[var.name]
+                logp += var.dist.log_prob(var.value)
+        return logp
+""", language="python")
+
+        with R:
+            st.markdown("### Live demo: build and evaluate a model")
+            st.markdown("""
+Let's build a simple Bayesian normal model:
+```
+mu    ~ Normal(0, 5)      # prior on the mean
+sigma ~ HalfNormal(1)     # prior on the SD (must be positive)
+y_i   ~ Normal(mu, sigma) # likelihood for each observation
+```
+""")
+            demo_mu    = st.slider("Try state: mu",    -3.0, 3.0, 1.0, 0.1, key="ppl_dmu")
+            demo_sigma = st.slider("Try state: sigma",  0.1, 3.0, 1.0, 0.1, key="ppl_dsg")
+            demo_n     = st.slider("# observations",    3, 20, 8, 1, key="ppl_dn")
+
+            np.random.seed(42)
+            y_demo = np.random.normal(1.5, 0.8, demo_n)
+
+            m_demo   = _ppl.Model()
+            mu_d     = m_demo.add_variable("mu",    _ppl.Normal(0, 5))
+            sigma_d  = m_demo.add_variable("sigma", _ppl.HalfNormal(1))
+
+            class _NormLik:
+                def __init__(self, mu_v, sig_v, y):
+                    self.mu_v = mu_v; self.sig_v = sig_v; self.y = y
+                def log_prob(self, x):
+                    return float(np.sum(stats.norm.logpdf(self.y, self.mu_v.value, self.sig_v.value)))
+
+            m_demo.add_variable("y", _NormLik(mu_d, sigma_d, y_demo),
+                                parents=[mu_d, sigma_d], observed=True, observed_data=y_demo)
+
+            state_demo = {"mu": demo_mu, "sigma": demo_sigma}
+            lp_val     = m_demo.log_prob(state_demo)
+
+            logp_prior_mu    = _ppl.Normal(0, 5).log_prob(demo_mu)
+            logp_prior_sigma = _ppl.HalfNormal(1).log_prob(demo_sigma)
+            logp_lik         = float(np.sum(stats.norm.logpdf(y_demo, demo_mu, demo_sigma)))
+
+            st.markdown(f"""
+**Evaluating at state** `{{mu={demo_mu:.1f}, sigma={demo_sigma:.1f}}}`
+
+| Component | Value |
+|---|---|
+| log p(mu) | `{logp_prior_mu:.3f}` |
+| log p(sigma) | `{logp_prior_sigma:.3f}` |
+| log p(y \| mu, sigma) | `{logp_lik:.3f}` |
+| **Joint log_prob** | **`{lp_val:.3f}`** |
+
+MCMC uses differences of joint log_prob values — the normalising constant Z cancels.
+""")
+            st.info("Move the sliders: joint log_prob increases as you approach the true mean (1.5).")
+
+    # ── PPL Step 2: Metropolis sampler ────────────────────────────────────────
+    elif ppl_step == 2:
+        L, R = st.columns([1, 1])
+        with L:
+            st.markdown("## The Metropolis sampler")
+            st.markdown("""
+The MCMC class wraps a Model and samples from its posterior.
+At each step it proposes a new state by perturbing every free variable
+independently with a Gaussian of width `proposal_std`, then accepts or
+rejects via the log-acceptance ratio.
+""")
+            st.code("""\
+class MCMC:
+    def __init__(self, model, initial_state=None, proposal_std=0.1):
+        self.model        = model
+        self.proposal_std = proposal_std
+        self._init_state  = initial_state or {k: 0.0 for k in model.free_vars}
+
+    def _reset(self):
+        self.current_state = dict(self._init_state)
+        self.chain = []; self.accepted = 0; self.proposed = 0
+
+    @property
+    def acceptance_rate(self):
+        return self.accepted / self.proposed if self.proposed > 0 else 0.0
+
+    def _proposal_step(self):
+        return {k: np.random.normal(self.current_state[k], self.proposal_std)
+                for k in self.model.free_vars}
+
+    def _metropolis(self, n_samples, burn_in):
+        for i in range(n_samples + burn_in):
+            proposed = self._proposal_step()
+            log_alpha = (self.model.log_prob(proposed)
+                         - self.model.log_prob(self.current_state))
+            if np.log(np.random.rand()) < log_alpha:
+                self.current_state = proposed
+                if i >= burn_in: self.accepted += 1
+            self.proposed += 1
+            if i >= burn_in: self.chain.append(self.current_state.copy())
+
+    def sample(self, method='metropolis', n_samples=1000, burn_in=500, **kw):
+        self._reset()
+        if method == 'metropolis':
+            self._metropolis(n_samples, burn_in)
+        elif method == 'hmc':
+            self._hmc(n_samples, burn_in, **kw)
+        return self.chain
+""", language="python")
+
+        with R:
+            st.markdown("### Interactive playground")
+            ppl_tgt_name = st.selectbox(
+                "Target", ["Standard Normal", "Bimodal Mixture", "Student-t (df=3)"],
+                key="ppl_play_tgt"
+            )
+            ppl_pstd = st.slider("proposal_std", 0.05, 4.0, 0.8, 0.05, key="ppl_pstd")
+            ppl_nsamp = st.slider("n_samples", 500, 5000, 2000, 500, key="ppl_nsamp")
+            ppl_seed  = st.number_input("Seed", 0, 999, 7, key="ppl_seed2")
+
+            if st.button("Run Metropolis", type="primary", key="ppl_run_mh"):
+                tgt_fn = TARGETS[ppl_tgt_name]["fn"]
+                class _Dist:
+                    def __init__(self, fn): self.fn = fn
+                    def log_prob(self, x): return float(self.fn(x))
+                np.random.seed(int(ppl_seed))
+                m_p  = _ppl.Model()
+                m_p.add_variable("x", _Dist(tgt_fn))
+                mcp  = _ppl.MCMC(m_p, initial_state={"x": 0.0}, proposal_std=ppl_pstd)
+                with st.spinner("Sampling…"):
+                    chain_p = mcp.sample("metropolis", n_samples=int(ppl_nsamp), burn_in=500)
+                xs_p = np.array([s["x"] for s in chain_p])
+                st.session_state["ppl_samples"] = dict(xs=xs_p, rate=mcp.acceptance_rate,
+                                                        tgt=ppl_tgt_name, method="Metropolis")
+
+            res_p = st.session_state["ppl_samples"]
+            if res_p:
+                st.metric("Acceptance rate", f"{res_p['rate']:.1%}")
+                xs_p = res_p["xs"]
+                xr_p = TARGETS[res_p["tgt"]]["range"]
+                st.plotly_chart(
+                    make_diagnostics(xs_p, TARGETS[res_p["tgt"]]["fn"], xr_p,
+                                     C_BLUE, f"PPL Metropolis — {res_p['tgt']}"),
+                    use_container_width=True,
+                )
+
+    # ── PPL Step 3: HMC ───────────────────────────────────────────────────────
+    elif ppl_step == 3:
+        L, R = st.columns([1, 1])
+        with L:
+            st.markdown("## HMC in the PPL")
+            st.markdown("""
+HMC needs the **gradient** of log_prob with respect to the free variables.
+Production PPLs (PyMC, Stan, Pyro) compute this via symbolic or algorithmic
+differentiation.  Our PPL uses **central finite differences** — simple,
+works with any distribution class, correct to O(h²).
+""")
+            st.code("""\
+def _grad_log_prob(self, state, h=1e-4):
+    \"\"\"Numerical gradient via central finite differences.\"\"\"
+    g = {}
+    for k in self.model.free_vars:
+        s_p = {**state, k: state[k] + h}
+        s_m = {**state, k: state[k] - h}
+        g[k] = (self.model.log_prob(s_p)
+                - self.model.log_prob(s_m)) / (2 * h)
+    return g
+
+def _hmc(self, n_samples, burn_in, step_size=0.05, n_leapfrog_steps=20):
+    keys = self.model.free_vars
+    for i in range(n_samples + burn_in):
+        q = dict(self.current_state)
+        p = {k: float(np.random.standard_normal()) for k in keys}
+
+        # Half-step momentum, then L full leapfrog steps
+        g    = self._grad_log_prob(q)
+        p_hf = {k: p[k] + 0.5 * step_size * g[k] for k in keys}
+        q_new, p_new = dict(q), dict(p_hf)
+        for l in range(n_leapfrog_steps):
+            q_new = {k: q_new[k] + step_size * p_new[k] for k in keys}
+            g_new = self._grad_log_prob(q_new)
+            factor = 0.5 if l == n_leapfrog_steps - 1 else 1.0
+            p_new  = {k: p_new[k] + factor * step_size * g_new[k] for k in keys}
+
+        H_curr = (-self.model.log_prob(q)
+                  + 0.5 * sum(p[k]**2 for k in keys))
+        H_prop = (-self.model.log_prob(q_new)
+                  + 0.5 * sum(p_new[k]**2 for k in keys))
+
+        if np.log(np.random.rand()) < H_curr - H_prop:
+            self.current_state = q_new
+            if i >= burn_in: self.accepted += 1
+        self.proposed += 1
+        if i >= burn_in:
+            self.chain.append(self.current_state.copy())
+""", language="python")
+
+            st.info("""
+**Why not autograd / JAX here?**
+The distribution classes call `scipy.stats`, which isn't differentiable by
+autograd.  A production PPL rewrites its math in a differentiable backend
+(pytensor, torch, jax) from the start.  Our numerical gradients are exact
+to O(h²) and completely general.
+""")
+
+        with R:
+            st.markdown("### Compare Metropolis vs HMC on the same target")
+            ppl_tgt_h = st.selectbox(
+                "Target", ["Standard Normal", "Bimodal Mixture", "Student-t (df=3)"],
+                key="ppl_hmc_tgt"
+            )
+            p_std_h = st.slider("Metropolis proposal_std", 0.1, 3.0, 0.8, 0.1, key="ppl_hstd")
+            h_ss    = st.slider("HMC step_size",         0.05, 0.6, 0.2, 0.05, key="ppl_hss")
+            h_L     = st.slider("HMC leapfrog steps",    3, 30, 15, 1, key="ppl_hL")
+            h_n     = st.slider("n_samples each",        500, 3000, 1500, 500, key="ppl_hn")
+            h_seed  = st.number_input("Seed", 0, 999, 7, key="ppl_hsd")
+
+            if st.button("Run both", type="primary", key="ppl_run_both"):
+                tgt_fn2 = TARGETS[ppl_tgt_h]["fn"]
+                class _Dist2:
+                    def __init__(self, fn): self.fn = fn
+                    def log_prob(self, x): return float(self.fn(x))
+                np.random.seed(int(h_seed))
+                # Metropolis
+                m_mh2 = _ppl.Model(); m_mh2.add_variable("x", _Dist2(tgt_fn2))
+                mc_mh = _ppl.MCMC(m_mh2, {"x": 0.0}, p_std_h)
+                with st.spinner("Metropolis…"):
+                    ch_mh = mc_mh.sample("metropolis", int(h_n), 500)
+                # HMC
+                np.random.seed(int(h_seed))
+                m_hm2 = _ppl.Model(); m_hm2.add_variable("x", _Dist2(tgt_fn2))
+                mc_hm = _ppl.MCMC(m_hm2, {"x": 0.0}, 0.1)
+                with st.spinner("HMC…"):
+                    ch_hm = mc_hm.sample("hmc", int(h_n), 500,
+                                          step_size=h_ss, n_leapfrog_steps=int(h_L))
+                xs_mh = np.array([s["x"] for s in ch_mh])
+                xs_hm = np.array([s["x"] for s in ch_hm])
+                st.session_state["ppl_samples"] = dict(xs_mh=xs_mh, xs_hm=xs_hm,
+                                                        mh_rate=mc_mh.acceptance_rate,
+                                                        hm_rate=mc_hm.acceptance_rate,
+                                                        tgt=ppl_tgt_h, mode="compare")
+
+            res_h = st.session_state["ppl_samples"]
+            if res_h and res_h.get("mode") == "compare":
+                c1, c2 = st.columns(2)
+                c1.metric("MH acceptance",  f"{res_h['mh_rate']:.1%}")
+                c2.metric("HMC acceptance", f"{res_h['hm_rate']:.1%}")
+                acf_mh2 = compute_acf(res_h["xs_mh"])
+                acf_hm2 = compute_acf(res_h["xs_hm"])
+                fig_cmp = go.Figure()
+                fig_cmp.add_trace(go.Scatter(x=list(range(1, len(acf_mh2)+1)), y=acf_mh2,
+                                             mode="lines", name="Metropolis",
+                                             line=dict(color=C_BLUE, width=2)))
+                fig_cmp.add_trace(go.Scatter(x=list(range(1, len(acf_hm2)+1)), y=acf_hm2,
+                                             mode="lines", name="HMC",
+                                             line=dict(color=C_RED, width=2)))
+                fig_cmp.add_hline(y=0, line_dash="dash", line_color="gray")
+                fig_cmp.update_layout(title="ACF — PPL Metropolis vs PPL HMC",
+                                       xaxis_title="Lag", height=280, margin=dict(t=50, b=20))
+                st.plotly_chart(fig_cmp, use_container_width=True)
+
+                tgt_fn3 = TARGETS[res_h["tgt"]]["fn"]
+                xr3 = TARGETS[res_h["tgt"]]["range"]
+                xs3, pd3 = density_curve(tgt_fn3, xr3)
+                fig_ov = go.Figure()
+                fig_ov.add_trace(go.Histogram(x=res_h["xs_mh"], histnorm="probability density",
+                                               nbinsx=60, opacity=0.45, name="Metropolis",
+                                               marker_color=C_BLUE))
+                fig_ov.add_trace(go.Histogram(x=res_h["xs_hm"], histnorm="probability density",
+                                               nbinsx=60, opacity=0.45, name="HMC",
+                                               marker_color=C_RED))
+                fig_ov.add_trace(go.Scatter(x=xs3, y=pd3, mode="lines",
+                                             line=dict(color=C_GREEN, width=2.5), name="True π"))
+                fig_ov.update_layout(barmode="overlay", title="Sample histograms vs target",
+                                      height=280, margin=dict(t=50, b=20))
+                st.plotly_chart(fig_ov, use_container_width=True)
+
+    # ── PPL Step 4: Random effects demo ───────────────────────────────────────
+    elif ppl_step == 4:
+        st.markdown("## Full demo — random effects model")
+        st.markdown(r"""
+We fit a hierarchical model to simulated classroom data:
+$$y_{ij} = \mu + u_i + \varepsilon_{ij}$$
+- **μ** — global mean (prior: N(0, 5))
+- **u_i** — group-specific random effects (prior: N(0, σ_u²))
+- **σ_u** — between-group SD (prior: HalfNormal(1))
+- **σ_e** — within-group SD (prior: HalfNormal(1))
+- **y_ij** — observed, 5 groups × 20 observations
+""")
+
+        code_col, ctrl_col = st.columns([3, 1])
+        with ctrl_col:
+            re_nsamp  = st.slider("n_samples", 1000, 6000, 3000, 500, key="ppl_re_n")
+            re_burn   = st.slider("burn_in",    500, 2000, 1000, 500, key="ppl_re_b")
+            re_pstd   = st.slider("proposal_std", 0.02, 0.3, 0.08, 0.01, key="ppl_re_std")
+            run_re    = st.button("Run sampler", type="primary", key="ppl_run_re")
+
+        with code_col:
+            st.code("""\
+# ── Simulate data ─────────────────────────────────────────────────────────────
+np.random.seed(42)
+n_groups, n_per = 5, 20
+true_mu      = 2.0
+true_sigma_u = 1.5   # between-group SD
+true_sigma_e = 0.5   # within-group SD
+group_ids    = np.repeat(np.arange(n_groups), n_per)
+true_u       = np.random.normal(0, true_sigma_u, n_groups)
+y_obs        = (true_mu + true_u[group_ids]
+                + np.random.normal(0, true_sigma_e, n_groups * n_per))
+
+# ── Build model ───────────────────────────────────────────────────────────────
+model   = Model()
+mu      = model.add_variable('mu',      Normal(0, 5))
+sigma_u = model.add_variable('sigma_u', HalfNormal(1))
+sigma_e = model.add_variable('sigma_e', HalfNormal(1))
+u       = [model.add_variable(f'u_{i}', Normal(0, 1), parents=[sigma_u])
+           for i in range(n_groups)]
+
+# NormalVecLikelihood scores all observations at once
+mu_obs  = model.add_deterministic(
+    'mu_obs',
+    lambda: mu.value + np.array([u[g].value for g in group_ids]),
+    parents=[mu, *u])
+y = model.add_variable('y',
+    NormalVecLikelihood(mu_obs, sigma_e, y_obs),
+    parents=[mu_obs, sigma_e], observed=True)
+
+# ── Sample ────────────────────────────────────────────────────────────────────
+init = {'mu': 0.0, 'sigma_u': 1.0, 'sigma_e': 1.0,
+        **{f'u_{i}': 0.0 for i in range(n_groups)}}
+mcmc = MCMC(model, initial_state=init, proposal_std=0.08)
+samples = mcmc.sample('metropolis', n_samples=3000, burn_in=1000)
+""", language="python")
+
+        if run_re:
+            np.random.seed(42)
+            n_groups, n_per = 5, 20
+            true_mu_re      = 2.0
+            true_sigma_u_re = 1.5
+            true_sigma_e_re = 0.5
+            group_ids_re    = np.repeat(np.arange(n_groups), n_per)
+            true_u_re       = np.random.normal(0, true_sigma_u_re, n_groups)
+            y_obs_re        = (true_mu_re + true_u_re[group_ids_re]
+                               + np.random.normal(0, true_sigma_e_re, n_groups * n_per))
+
+            model_re = _ppl.Model()
+            mu_re    = model_re.add_variable("mu",      _ppl.Normal(0, 5))
+            su_re    = model_re.add_variable("sigma_u", _ppl.HalfNormal(1))
+            se_re    = model_re.add_variable("sigma_e", _ppl.HalfNormal(1))
+            u_re     = [model_re.add_variable(f"u_{i}", _ppl.Normal(0, 1), parents=[su_re])
+                        for i in range(n_groups)]
+            mu_obs_re = model_re.add_deterministic(
+                "mu_obs",
+                lambda: mu_re.value + np.array([u_re[g].value for g in group_ids_re]),
+                parents=[mu_re, *u_re])
+            model_re.add_variable("y", _ppl.NormalVecLikelihood(mu_obs_re, se_re, y_obs_re),
+                                   parents=[mu_obs_re, se_re], observed=True, observed_data=y_obs_re)
+
+            init_re = {"mu": 0.0, "sigma_u": 1.0, "sigma_e": 1.0,
+                       **{f"u_{i}": 0.0 for i in range(n_groups)}}
+            mc_re = _ppl.MCMC(model_re, initial_state=init_re, proposal_std=float(re_pstd))
+            with st.spinner(f"Running Metropolis ({int(re_nsamp)} samples, burn-in {int(re_burn)})…"):
+                samples_re = mc_re.sample("metropolis", int(re_nsamp), int(re_burn))
+            st.session_state["ppl_samples"] = dict(
+                mode="re",
+                samples=samples_re,
+                rate=mc_re.acceptance_rate,
+                true_mu=true_mu_re, true_su=true_sigma_u_re, true_se=true_sigma_e_re,
+                true_u=true_u_re, n_groups=n_groups,
+            )
+
+        res_re = st.session_state["ppl_samples"]
+        if res_re and res_re.get("mode") == "re":
+            st.metric("Acceptance rate", f"{res_re['rate']:.1%}")
+            samps = res_re["samples"]
+            params_re = {
+                "mu":      (np.array([s["mu"]      for s in samps]), res_re["true_mu"],  C_BLUE),
+                "sigma_u": (np.array([s["sigma_u"] for s in samps]), res_re["true_su"],  C_ORANGE),
+                "sigma_e": (np.array([s["sigma_e"] for s in samps]), res_re["true_se"],  C_GREEN),
+            }
+            ng = res_re["n_groups"]
+            u_chains_re = [np.array([s[f"u_{i}"] for s in samps]) for i in range(ng)]
+
+            fig_re, axes_re = plt.subplots(3, 3, figsize=(13, 9))
+            fig_re.suptitle("Random Effects Model — Posterior Diagnostics",
+                             fontsize=13, fontweight="bold")
+            colors_re = [C_BLUE, C_ORANGE, C_GREEN]
+            for col, (name, (chain, true_val, col_c)) in enumerate(params_re.items()):
+                hex_c = col_c
+                axes_re[0, col].plot(chain, lw=0.5, color=hex_c, alpha=0.8)
+                axes_re[0, col].axhline(true_val, color="red", lw=1.2, linestyle="--", label="true")
+                axes_re[0, col].set_title(f"{name} — trace", fontsize=9)
+                axes_re[0, col].legend(fontsize=7)
+
+                axes_re[1, col].hist(chain, bins=50, color=hex_c, alpha=0.7, density=True)
+                axes_re[1, col].axvline(true_val,       color="red",   lw=1.5, ls="--", label="true")
+                axes_re[1, col].axvline(chain.mean(),   color="black", lw=1.5, ls="-",
+                                         label=f"mean={chain.mean():.2f}")
+                axes_re[1, col].set_title(f"{name} — posterior", fontsize=9)
+                axes_re[1, col].legend(fontsize=7)
+
+                acf_re = compute_acf(chain, 40)
+                axes_re[2, col].bar(range(1, 41), acf_re, color=hex_c, alpha=0.7, width=0.8)
+                axes_re[2, col].axhline(0, color="black", lw=0.8)
+                axes_re[2, col].set_title(f"{name} — ACF", fontsize=9)
+                axes_re[2, col].set_ylim(-0.3, 1.0)
+
+            plt.tight_layout()
+            st.pyplot(fig_re)
+            plt.close(fig_re)
+
+            # Random effects recovery
+            fig_u2, ax_u2 = plt.subplots(figsize=(8, 4))
+            post_means_u = [u_chains_re[i].mean() for i in range(ng)]
+            post_stds_u  = [u_chains_re[i].std()  for i in range(ng)]
+            x_u = np.arange(ng)
+            ax_u2.errorbar(x_u, post_means_u, yerr=1.96*np.array(post_stds_u),
+                           fmt="o", color=C_BLUE, capsize=6, label="posterior mean ± 1.96 SD")
+            ax_u2.scatter(x_u, res_re["true_u"], color="red", zorder=5,
+                          marker="x", s=90, lw=2, label="true uᵢ")
+            ax_u2.axhline(0, color="gray", lw=0.8, ls="--")
+            ax_u2.set_xticks(x_u); ax_u2.set_xticklabels([f"Group {i}" for i in range(ng)])
+            ax_u2.set_title("Random effects recovery — posterior vs truth", fontsize=11)
+            ax_u2.legend(fontsize=9)
+            plt.tight_layout()
+            st.pyplot(fig_u2)
+            plt.close(fig_u2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLACIER CASE STUDY TAB
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_glacier:
+    st.header("Case Study — Sperry Glacier Mass Balance")
+    st.markdown("""
+Glacier National Park's **Sperry Glacier** has been losing mass steadily since systematic
+monitoring began in 2005. We'll fit a simple physical ODE model to 21 years of real USGS
+mass-balance data using **(a) our PPL** and **(b) PyMC with NUTS**, then compare both
+posteriors side-by-side.
+""")
+
+    # ── Load data ──────────────────────────────────────────────────────────────
+    DATA_PATH = os.path.join(os.path.dirname(__file__), "Sperry_annual_mass_balance.csv")
+
+    @st.cache_data(show_spinner=False)
+    def load_sperry():
+        df = pd.read_csv(DATA_PATH)
+        years   = df["Year"].values.astype(int)
+        Ba      = df["Ba"].values.astype(float)   # annual balance (m w.e.) — OBSERVED
+        Bw      = df["Bw"].values.astype(float)   # winter balance  → P forcing
+        Bs      = df["Bs"].values.astype(float)   # summer balance  → T forcing
+        P_acc   = Bw                               # accumulation (m w.e./yr)
+        T_melt  = -Bs                              # melt index (m w.e./yr, positive)
+        return years, Ba, Bw, Bs, P_acc, T_melt
+
+    years_sp, Ba_sp, Bw_sp, Bs_sp, P_acc_sp, T_melt_sp = load_sperry()
+    n_years_sp = len(years_sp)
+
+    # ── ODE simulation ─────────────────────────────────────────────────────────
+    def glacier_ode(mu, c, T0, tau, V0, T_melt_arr, P_acc_arr):
+        """
+        Forward Euler integration of:
+          dV/dt = c·P(t) − μ·max(T_melt(t) − T₀, 0) − V(t)/τ
+        B_t = dV/dt  (specific mass balance in m w.e./yr)
+        """
+        n  = len(T_melt_arr)
+        V  = float(V0)
+        Bsim = np.zeros(n)
+        for t in range(n):
+            melt_t = float(mu) * max(float(T_melt_arr[t]) - float(T0), 0.0)
+            accum_t = float(c) * float(P_acc_arr[t])
+            dV_t   = accum_t - melt_t - V / float(tau)
+            Bsim[t] = dV_t
+            V += dV_t
+        return Bsim
+
+    # ── Section 1: The physical model ──────────────────────────────────────────
+    with st.expander("📐 Section 1 — The physical model", expanded=True):
+        eL, eR = st.columns([1, 1])
+        with eL:
+            st.markdown("### The ODE")
+            st.latex(r"\frac{dV}{dt} = \underbrace{c \cdot P(t)}_{\text{accumulation}} - \underbrace{\mu \cdot \max(T(t) - T_0,\, 0)}_{\text{melt}} - \underbrace{\frac{V(t)}{\tau}}_{\text{calving/outflow}}")
+            st.markdown("""
+**Observed variable:** Annual specific mass balance  B_t = dV/dt (m w.e./yr)
+
+**Known forcings** (derived from seasonal observations):
+- P(t) = winter mass balance Bw(t) — accumulation proxy (m w.e./yr)
+- T(t) = −summer mass balance |Bs(t)| — melt index (m w.e./yr)
+
+We integrate with forward Euler (dt = 1 yr), which is sufficient for this annual model.
+""")
+        with eR:
+            st.markdown("### Parameters to infer")
+            st.markdown("""
+| Parameter | Description | Prior |
+|---|---|---|
+| **μ** | Melt sensitivity (fraction of melt index that drives volume loss) | HalfNormal(1) |
+| **c** | Accumulation efficiency | HalfNormal(1) |
+| **T₀** | Melt threshold (m w.e./yr) | Normal(2, 1.5) |
+| **τ** | Volume response time (years) | Exponential(lam=1/20) |
+| **V₀** | Initial volume (m w.e. equivalent) | Normal(10, 5) |
+| **σ** | Observation noise (m w.e./yr) | HalfNormal(0.5) |
+
+We have **21 data points** (2005–2025) and **6 parameters** — a realistic,
+moderately constrained inference problem.  The parameters are correlated in the
+posterior, making MCMC the natural tool.
+""")
+
+    # ── Section 2: The data ────────────────────────────────────────────────────
+    with st.expander("📊 Section 2 — The data (Sperry Glacier, USGS)", expanded=True):
+        fig_data_sp = make_subplots(rows=3, cols=1,
+            subplot_titles=["Accumulation forcing P(t) = Bw (m w.e./yr)",
+                            "Melt index T(t) = −Bs (m w.e./yr)",
+                            "Annual mass balance Ba — OBSERVED (m w.e./yr)"],
+            vertical_spacing=0.12)
+        fig_data_sp.add_trace(go.Bar(x=years_sp, y=P_acc_sp,
+                                     marker_color="steelblue", name="P(t) = Bw"), 1, 1)
+        fig_data_sp.add_trace(go.Bar(x=years_sp, y=T_melt_sp,
+                                     marker_color="tomato", name="T(t) = −Bs"), 2, 1)
+        fig_data_sp.add_trace(go.Bar(x=years_sp, y=Ba_sp,
+                                     marker_color=[C_GREEN if v >= 0 else C_RED for v in Ba_sp],
+                                     name="Ba (observed)"), 3, 1)
+        fig_data_sp.add_hline(y=0, line_dash="dash", line_color="gray", row=3, col=1)
+        fig_data_sp.add_hline(y=float(Ba_sp.mean()), line_dash="dot", line_color="black",
+                               annotation_text=f"mean={Ba_sp.mean():.2f}",
+                               annotation_position="bottom right", row=3, col=1)
+        fig_data_sp.update_layout(height=560, margin=dict(t=60, b=20),
+                                   showlegend=False,
+                                   title="Sperry Glacier, Glacier National Park MT — USGS data 2005–2025")
+        st.plotly_chart(fig_data_sp, use_container_width=True)
+        st.caption("Data: USGS Benchmark Glacier Program, doi:10.5066/F7HD7SRF, calibrated v10.0 (2026).")
+
+    # ── Section 3: PPL inference ───────────────────────────────────────────────
+    with st.expander("🔧 Section 3 — Fit with our PPL (Metropolis)", expanded=False):
+        p3L, p3R = st.columns([1, 2])
+        with p3L:
+            st.markdown("### Metropolis on the glacier posterior")
+            st.code("""\
+# Custom likelihood wrapping the ODE
+class GlacierLik:
+    def __init__(self, T_melt, P_acc, B_obs, vars):
+        self.T_melt = T_melt; self.P_acc = P_acc
+        self.B_obs  = B_obs;  self.vars  = vars
+    def log_prob(self, x):
+        v = self.vars
+        B_sim = glacier_ode(
+            v['mu'].value, v['c'].value, v['T0'].value,
+            v['tau'].value, v['V0'].value,
+            self.T_melt, self.P_acc)
+        sigma = v['sigma'].value
+        if sigma <= 0: return -np.inf
+        return float(np.sum(
+            sp.norm.logpdf(self.B_obs, B_sim, sigma)))
+
+# Build the model
+model = Model()
+mu_v  = model.add_variable('mu',    HalfNormal(1))
+c_v   = model.add_variable('c',     HalfNormal(1))
+T0_v  = model.add_variable('T0',    Normal(2, 1.5))
+tau_v = model.add_variable('tau',   Exponential(1/20))
+V0_v  = model.add_variable('V0',    Normal(10, 5))
+sg_v  = model.add_variable('sigma', HalfNormal(0.5))
+obs_v = model.add_variable('obs', GlacierLik(...),
+        parents=[mu_v,c_v,T0_v,tau_v,V0_v,sg_v],
+        observed=True)
+""", language="python")
+            ppl_gl_n    = st.slider("n_samples", 1000, 8000, 4000, 1000, key="gl_n")
+            ppl_gl_burn = st.slider("burn_in",    500, 3000, 2000,  500, key="gl_burn")
+            ppl_gl_std  = st.slider("proposal_std", 0.01, 0.20, 0.05, 0.01, key="gl_std")
+            run_ppl_gl  = st.button("Run PPL Metropolis", type="primary", key="gl_ppl_run")
+
+        with p3R:
+            if run_ppl_gl:
+                import scipy.stats as _sp2
+
+                class _GlacierLik:
+                    def __init__(self, T_melt, P_acc, B_obs, vdict):
+                        self.T_melt = T_melt; self.P_acc = P_acc
+                        self.B_obs = B_obs;   self.vdict = vdict
+                    def log_prob(self, x):
+                        v = self.vdict
+                        try:
+                            mu_val  = v["mu"].value
+                            c_val   = v["c"].value
+                            T0_val  = v["T0"].value
+                            tau_val = v["tau"].value
+                            V0_val  = v["V0"].value
+                            sg_val  = v["sigma"].value
+                            if sg_val is None or sg_val <= 0: return -np.inf
+                            if tau_val is None or tau_val <= 0: return -np.inf
+                            B_sim = glacier_ode(mu_val, c_val, T0_val, tau_val, V0_val,
+                                                self.T_melt, self.P_acc)
+                            return float(np.sum(_sp2.norm.logpdf(self.B_obs, B_sim, sg_val)))
+                        except Exception:
+                            return -np.inf
+
+                m_gl   = _ppl.Model()
+                mu_gl  = m_gl.add_variable("mu",    _ppl.HalfNormal(1.0))
+                c_gl   = m_gl.add_variable("c",     _ppl.HalfNormal(1.0))
+                T0_gl  = m_gl.add_variable("T0",    _ppl.Normal(2.0, 1.5))
+                tau_gl = m_gl.add_variable("tau",   _ppl.Exponential(rate=1.0/20.0))
+                V0_gl  = m_gl.add_variable("V0",    _ppl.Normal(10.0, 5.0))
+                sg_gl  = m_gl.add_variable("sigma", _ppl.HalfNormal(0.5))
+                vdict  = {"mu": mu_gl, "c": c_gl, "T0": T0_gl,
+                          "tau": tau_gl, "V0": V0_gl, "sigma": sg_gl}
+                m_gl.add_variable("obs", _GlacierLik(T_melt_sp, P_acc_sp, Ba_sp, vdict),
+                                   parents=list(vdict.values()), observed=True, observed_data=Ba_sp)
+
+                init_gl = {"mu": 0.80, "c": 0.58, "T0": 2.0, "tau": 20.0, "V0": 10.0, "sigma": 0.4}
+                mc_gl = _ppl.MCMC(m_gl, initial_state=init_gl, proposal_std=float(ppl_gl_std))
+                with st.spinner(f"Running Metropolis on glacier model ({int(ppl_gl_n)} samples)…"):
+                    samps_gl = mc_gl.sample("metropolis", int(ppl_gl_n), int(ppl_gl_burn))
+
+                st.session_state["glacier_ppl_res"] = dict(
+                    samples=samps_gl, rate=mc_gl.acceptance_rate)
+
+            res_gl = st.session_state["glacier_ppl_res"]
+            if res_gl:
+                st.metric("Acceptance rate", f"{res_gl['rate']:.1%}")
+                sgl = res_gl["samples"]
+                gl_params = ["mu", "c", "T0", "tau", "V0", "sigma"]
+                gl_chains = {k: np.array([s[k] for s in sgl]) for k in gl_params}
+
+                # Posterior means summary
+                st.markdown("**Posterior means:**")
+                pm_cols = st.columns(len(gl_params))
+                for i, k in enumerate(gl_params):
+                    pm_cols[i].metric(k, f"{gl_chains[k].mean():.3f}",
+                                       delta=f"±{gl_chains[k].std():.3f}")
+
+                # Trace + histogram for each
+                fig_gl_diag, axes_gl = plt.subplots(2, 3, figsize=(13, 6))
+                fig_gl_diag.suptitle("PPL Metropolis — Glacier Posterior", fontsize=12, fontweight="bold")
+                colors_gl = [C_BLUE, C_ORANGE, C_GREEN, C_RED, "#9467bd", "#8c564b"]
+                for idx, k in enumerate(gl_params):
+                    r, c2 = divmod(idx, 3)
+                    axes_gl[r, c2].plot(gl_chains[k], lw=0.5, color=colors_gl[idx], alpha=0.8)
+                    axes_gl[r, c2].set_title(f"{k}  mean={gl_chains[k].mean():.3f}", fontsize=9)
+                plt.tight_layout()
+                st.pyplot(fig_gl_diag)
+                plt.close(fig_gl_diag)
+
+                # Posterior predictive retrodiction
+                np.random.seed(0)
+                B_post_pred = np.array([
+                    glacier_ode(s["mu"], s["c"], s["T0"], s["tau"], s["V0"], T_melt_sp, P_acc_sp)
+                    for s in sgl[::max(1, len(sgl)//200)]
+                ])
+                Bpp_lo = np.percentile(B_post_pred, 5, axis=0)
+                Bpp_hi = np.percentile(B_post_pred, 95, axis=0)
+                Bpp_md = np.percentile(B_post_pred, 50, axis=0)
+
+                fig_ret = go.Figure()
+                fig_ret.add_trace(go.Scatter(x=np.concatenate([years_sp, years_sp[::-1]]),
+                                              y=np.concatenate([Bpp_hi, Bpp_lo[::-1]]),
+                                              fill="toself", fillcolor="rgba(99,110,250,0.2)",
+                                              line=dict(color="rgba(0,0,0,0)"), name="90% CI"))
+                fig_ret.add_trace(go.Scatter(x=years_sp, y=Bpp_md, mode="lines",
+                                              line=dict(color=C_BLUE, width=2), name="Posterior median"))
+                fig_ret.add_trace(go.Scatter(x=years_sp, y=Ba_sp, mode="markers",
+                                              marker=dict(size=10, color="black", symbol="x"),
+                                              name="Observed Ba"))
+                fig_ret.update_layout(title="Posterior predictive retrodiction — PPL",
+                                       xaxis_title="Year", yaxis_title="B (m w.e./yr)",
+                                       height=340, margin=dict(t=50, b=20))
+                st.plotly_chart(fig_ret, use_container_width=True)
+            else:
+                st.info("Click **Run PPL Metropolis** to fit the model.")
+
+    # ── Section 4: PyMC inference ──────────────────────────────────────────────
+    with st.expander("⚡ Section 4 — Fit with PyMC (NUTS)", expanded=False):
+        p4L, p4R = st.columns([1, 2])
+        with p4L:
+            st.markdown("### The same model in PyMC")
+            st.code("""\
+import pymc as pm
+import pytensor.tensor as pt
+
+with pm.Model() as pymc_model:
+    # Priors (same as PPL model)
+    mu_pm    = pm.HalfNormal('mu',    sigma=1.0)
+    c_pm     = pm.HalfNormal('c',     sigma=1.0)
+    T0_pm    = pm.Normal('T0',    mu=2, sigma=1.5)
+    tau_pm   = pm.Exponential('tau',  lam=1/20)
+    V0_pm    = pm.Normal('V0',    mu=10, sigma=5)
+    sigma_pm = pm.HalfNormal('sigma', sigma=0.5)
+
+    # Forward Euler ODE using pytensor ops
+    # Python loop builds the computational graph once
+    T_pt = pt.as_tensor_variable(T_melt)
+    P_pt = pt.as_tensor_variable(P_acc)
+    V_curr = V0_pm
+    B_list = []
+    for t in range(n_years):
+        melt_t  = mu_pm * pt.maximum(T_pt[t] - T0_pm, 0.0)
+        accum_t = c_pm  * P_pt[t]
+        dV_t    = accum_t - melt_t - V_curr / tau_pm
+        B_list.append(dV_t)
+        V_curr  = V_curr + dV_t
+    B_sim_pt = pt.stack(B_list)
+
+    # Likelihood
+    pm.Normal('B_obs', mu=B_sim_pt, sigma=sigma_pm,
+              observed=B_obs)
+
+    # NUTS (No U-Turn Sampler)
+    trace = pm.sample(1000, tune=1000, target_accept=0.9,
+                      progressbar=False, chains=2)
+""", language="python")
+            pymc_n    = st.slider("Draws per chain", 500, 2000, 1000, 250, key="gl_pymc_n")
+            pymc_tune = st.slider("Tuning steps",    500, 2000, 1000, 250, key="gl_pymc_tune")
+            run_pymc  = st.button("Run PyMC NUTS", type="primary", key="gl_pymc_run")
+
+        with p4R:
+            if run_pymc:
+                try:
+                    import pymc as pm
+                    import pytensor.tensor as pt
+                    import arviz as az
+                    import logging
+                    logging.getLogger("pymc").setLevel(logging.ERROR)
+                    warnings.filterwarnings("ignore")
+
+                    T_melt_np = T_melt_sp.astype("float64")
+                    P_acc_np  = P_acc_sp.astype("float64")
+                    B_obs_np  = Ba_sp.astype("float64")
+                    ny        = n_years_sp
+
+                    with pm.Model() as pm_model:
+                        mu_pm    = pm.HalfNormal("mu",    sigma=1.0)
+                        c_pm     = pm.HalfNormal("c",     sigma=1.0)
+                        T0_pm    = pm.Normal("T0",    mu=2.0, sigma=1.5)
+                        tau_pm   = pm.Exponential("tau",  lam=1.0/20.0)
+                        V0_pm    = pm.Normal("V0",    mu=10.0, sigma=5.0)
+                        sigma_pm = pm.HalfNormal("sigma", sigma=0.5)
+
+                        T_pt = pt.as_tensor_variable(T_melt_np)
+                        P_pt = pt.as_tensor_variable(P_acc_np)
+                        V_curr = V0_pm
+                        B_list_pt = []
+                        for t in range(ny):
+                            melt_t  = mu_pm * pt.maximum(T_pt[t] - T0_pm, 0.0)
+                            accum_t = c_pm  * P_pt[t]
+                            dV_t    = accum_t - melt_t - V_curr / tau_pm
+                            B_list_pt.append(dV_t)
+                            V_curr  = V_curr + dV_t
+                        B_sim_pt = pt.stack(B_list_pt)
+
+                        pm.Normal("B_obs", mu=B_sim_pt, sigma=sigma_pm, observed=B_obs_np)
+
+                        with st.spinner(f"Running PyMC NUTS ({int(pymc_n)} draws, {int(pymc_tune)} tune)…"):
+                            trace_pm = pm.sample(int(pymc_n), tune=int(pymc_tune),
+                                                  target_accept=0.9, progressbar=False,
+                                                  chains=2, cores=1,
+                                                  return_inferencedata=True)
+
+                    st.session_state["glacier_pymc_res"] = dict(trace=trace_pm)
+
+                except Exception as e:
+                    st.error(f"PyMC error: {e}")
+
+            res_pm = st.session_state["glacier_pymc_res"]
+            if res_pm:
+                import arviz as az
+                trace_pm = res_pm["trace"]
+                param_names_pm = ["mu", "c", "T0", "tau", "V0", "sigma"]
+
+                st.markdown("### ArviZ summary")
+                summary_df = az.summary(trace_pm, var_names=param_names_pm)
+                st.dataframe(summary_df.style.format("{:.3f}"), use_container_width=True)
+
+                st.markdown("### Posterior distributions (NUTS)")
+                fig_az, axes_az = plt.subplots(2, 3, figsize=(13, 6))
+                fig_az.suptitle("PyMC NUTS — Glacier Posterior", fontsize=12, fontweight="bold")
+                colors_az = [C_BLUE, C_ORANGE, C_GREEN, C_RED, "#9467bd", "#8c564b"]
+                for idx, k in enumerate(param_names_pm):
+                    r, c2 = divmod(idx, 3)
+                    chain_az = trace_pm.posterior[k].values.flatten()
+                    axes_az[r, c2].hist(chain_az, bins=50, color=colors_az[idx],
+                                         alpha=0.7, density=True)
+                    axes_az[r, c2].axvline(chain_az.mean(), color="black", lw=1.5,
+                                            label=f"mean={chain_az.mean():.3f}")
+                    axes_az[r, c2].set_title(k, fontsize=10)
+                    axes_az[r, c2].legend(fontsize=7)
+                plt.tight_layout()
+                st.pyplot(fig_az)
+                plt.close(fig_az)
+
+                # Posterior predictive retrodiction
+                mu_az  = trace_pm.posterior["mu"].values.flatten()
+                c_az   = trace_pm.posterior["c"].values.flatten()
+                T0_az  = trace_pm.posterior["T0"].values.flatten()
+                tau_az = trace_pm.posterior["tau"].values.flatten()
+                V0_az  = trace_pm.posterior["V0"].values.flatten()
+                idx_samp = np.random.choice(len(mu_az), 200, replace=False)
+                B_ppc = np.array([
+                    glacier_ode(mu_az[i], c_az[i], T0_az[i], tau_az[i], V0_az[i],
+                                T_melt_sp, P_acc_sp)
+                    for i in idx_samp
+                ])
+                Bppc_lo = np.percentile(B_ppc, 5, axis=0)
+                Bppc_hi = np.percentile(B_ppc, 95, axis=0)
+                Bppc_md = np.percentile(B_ppc, 50, axis=0)
+
+                fig_ret2 = go.Figure()
+                fig_ret2.add_trace(go.Scatter(
+                    x=np.concatenate([years_sp, years_sp[::-1]]),
+                    y=np.concatenate([Bppc_hi, Bppc_lo[::-1]]),
+                    fill="toself", fillcolor="rgba(239,85,59,0.2)",
+                    line=dict(color="rgba(0,0,0,0)"), name="90% CI"))
+                fig_ret2.add_trace(go.Scatter(x=years_sp, y=Bppc_md, mode="lines",
+                                               line=dict(color=C_RED, width=2), name="Posterior median"))
+                fig_ret2.add_trace(go.Scatter(x=years_sp, y=Ba_sp, mode="markers",
+                                               marker=dict(size=10, color="black", symbol="x"),
+                                               name="Observed Ba"))
+                fig_ret2.update_layout(title="Posterior predictive retrodiction — PyMC NUTS",
+                                        xaxis_title="Year", yaxis_title="B (m w.e./yr)",
+                                        height=340, margin=dict(t=50, b=20))
+                st.plotly_chart(fig_ret2, use_container_width=True)
+            else:
+                st.info("Click **Run PyMC NUTS** to fit the model.")
+
+    # ── Section 5: Comparison ──────────────────────────────────────────────────
+    with st.expander("⚖️ Section 5 — Compare both samplers", expanded=False):
+        res_ppl_c  = st.session_state["glacier_ppl_res"]
+        res_pymc_c = st.session_state["glacier_pymc_res"]
+
+        if res_ppl_c and res_pymc_c:
+            import arviz as az
+            st.markdown("### Posterior violin plots — PPL Metropolis vs PyMC NUTS")
+            sgl_c = res_ppl_c["samples"]
+            trace_c = res_pymc_c["trace"]
+            compare_params = ["mu", "c", "T0", "tau"]
+
+            fig_viol, axes_v = plt.subplots(1, len(compare_params), figsize=(13, 5))
+            fig_viol.suptitle("PPL Metropolis (blue) vs PyMC NUTS (red) — posterior marginals",
+                               fontsize=11, fontweight="bold")
+            for idx, k in enumerate(compare_params):
+                ppl_ch  = np.array([s[k] for s in sgl_c])
+                pymc_ch = trace_c.posterior[k].values.flatten()
+                ax_v = axes_v[idx]
+                parts = ax_v.violinplot([ppl_ch, pymc_ch], positions=[0, 1],
+                                         showmedians=True, showextrema=False)
+                parts["bodies"][0].set_facecolor(C_BLUE); parts["bodies"][0].set_alpha(0.6)
+                parts["bodies"][1].set_facecolor(C_RED);  parts["bodies"][1].set_alpha(0.6)
+                ax_v.set_xticks([0, 1]); ax_v.set_xticklabels(["PPL\nMetropolis", "PyMC\nNUTS"])
+                ax_v.set_title(k, fontsize=10)
+            plt.tight_layout()
+            st.pyplot(fig_viol)
+            plt.close(fig_viol)
+
+            st.markdown("### Side-by-side posterior means")
+            cmp_data = {}
+            for k in compare_params:
+                ppl_v  = np.array([s[k] for s in sgl_c])
+                pymc_v = trace_c.posterior[k].values.flatten()
+                cmp_data[k] = {
+                    "PPL mean": round(float(ppl_v.mean()), 3),
+                    "PPL std":  round(float(ppl_v.std()),  3),
+                    "NUTS mean": round(float(pymc_v.mean()), 3),
+                    "NUTS std":  round(float(pymc_v.std()),  3),
+                }
+            st.dataframe(pd.DataFrame(cmp_data).T, use_container_width=True)
+
+            st.markdown("""
+### What did each sampler struggle with?
+
+**PPL Metropolis**
+- Proposes each parameter *independently* with a fixed Gaussian, so correlated
+  parameters (e.g. μ and T₀ both affect melt) cause the acceptance rate to drop
+  unless `proposal_std` is tuned carefully.
+- Each evaluation calls the forward Euler ODE in Python — slow enough that
+  5000 samples takes several seconds.  HMC would need numerical gradients with
+  `2·n_params` ODE calls per leapfrog step, making it even slower here.
+- The chain can get stuck near τ ≈ 0 or σ ≈ 0 without constrained proposals.
+
+**PyMC NUTS**
+- The pytensor computation graph allows exact gradient computation via autodiff —
+  each NUTS step costs one gradient call (not 2·n_params × n_leapfrog evaluations).
+- NUTS self-tunes the step size and number of leapfrog steps during warmup, so
+  no manual tuning of ε or L is needed.
+- The No-U-Turn stopping criterion prevents energy-wasting U-turns, giving
+  nearly uncorrelated draws — low ACF lag-1, small ESS/draw ratio.
+- Practical result: 2 × 1000 NUTS draws typically outperform 5000 Metropolis
+  samples in effective sample size for this model.
+
+**When would you choose the PPL over PyMC?**
+For teaching, rapid prototyping, or highly custom models that don't fit any
+standard distribution family.  PyMC wins when you need production-quality
+inference on a well-structured model.
+""")
+        else:
+            st.info("Run both **Section 3** (PPL) and **Section 4** (PyMC) first to see the comparison.")
