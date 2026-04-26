@@ -538,10 +538,108 @@ def step_nav(key, labels):
     st.divider()
     return step
 
+# ── Phenology helpers ──────────────────────────────────────────────────────────
+
+def integrate_gdd_fast(T_arr: np.ndarray, T_base: float,
+                       H_star: float, t0_int: int) -> np.ndarray:
+    """
+    Vectorised GDD integration.
+
+    For each year, zero out heat on days < t0, cumsum the daily GDD, and
+    return the first day where H_cum >= H_star (1-indexed DOY).
+    Falls back to 365 for years that never reach the threshold.
+    """
+    t0_int = max(0, min(int(t0_int), T_arr.shape[1] - 1))
+    gdd    = np.maximum(T_arr - T_base, 0.0)
+    gdd[:, :t0_int] = 0.0
+    H_cum  = np.cumsum(gdd, axis=1)
+    crossed = H_cum >= H_star
+    has_crossed = crossed.any(axis=1)
+    return np.where(has_crossed,
+                    np.argmax(crossed, axis=1).astype(float) + 1.0,
+                    365.0)
+
+
+@st.cache_data(show_spinner=False)
+def generate_phenology_data():
+    """Simulate 40 years of GDD-driven bloom observations."""
+    np.random.seed(42)
+    N_YEARS        = 40
+    TRUE_T_BASE    = 3.0
+    TRUE_H_STAR    = 220.0
+    TRUE_T0        = 50
+    TRUE_SIGMA     = 4.0
+    years          = np.arange(1980, 1980 + N_YEARS)
+
+    def _daily_temps(year, n_days=365, warming_rate=0.03):
+        t        = np.arange(n_days)
+        baseline = -8 + 18 * np.sin(np.pi * (t - 60) / 180)
+        trend    = warming_rate * (year - 1980)
+        noise    = np.random.normal(0, 3, n_days)
+        return baseline + trend + noise
+
+    T_daily  = np.array([_daily_temps(yr) for yr in years])
+    doy_true = integrate_gdd_fast(T_daily, TRUE_T_BASE, TRUE_H_STAR, TRUE_T0)
+    doy_obs  = np.round(doy_true + np.random.normal(0, TRUE_SIGMA, N_YEARS)).astype(float)
+
+    true_params = dict(T_base=TRUE_T_BASE, H_star=TRUE_H_STAR,
+                       t0=float(TRUE_T0),  sigma=TRUE_SIGMA)
+    return T_daily, doy_obs, years, true_params
+
+
+def make_log_prob_pheno(doy_obs_arr: np.ndarray, T_daily_arr: np.ndarray):
+    """
+    Returns a log_prob callable (state dict → float) that combines:
+      - priors:  T_base ~ N(2,3),  H_star ~ HalfNormal(200),
+                 t0 ~ Uniform(1,120),  sigma ~ HalfNormal(10)
+      - likelihood: DOY ~ N(t*(theta), sigma)
+
+    # ── To use real data ──────────────────────────────────────────────────
+    # Bloom observations:
+    #   RMBL Phenology Project: osf.io/jt4n5
+    #   USA-NPN (Montana species): usanpn.org/data
+    #   Species to try: Delphinium barbeyi or Mertensia ciliata
+    #
+    # Temperature forcing:
+    #   NOAA GHCN daily: ncei.noaa.gov  (Crested Butte CO / Missoula MT)
+    #   Daymet gridded 1-km daily: daymet.ornl.gov
+    #
+    # Expected shapes:
+    #   doy_obs_arr : (n_years,)   float   — observed first-bloom DOY
+    #   T_daily_arr : (n_years, 365) float  — daily mean temperatures (°C)
+    # ─────────────────────────────────────────────────────────────────────
+    """
+    import scipy.stats as _sp2
+
+    def log_prob(state: dict) -> float:
+        T_base = state["T_base"]
+        H_star = state["H_star"]
+        t0_val = state["t0"]
+        sigma  = state["sigma"]
+
+        if sigma <= 0 or H_star <= 0:
+            return -np.inf
+        if t0_val < 1.0 or t0_val > 120.0:
+            return -np.inf
+
+        # Priors
+        lp  = float(_sp2.norm.logpdf(T_base, 2.0, 3.0))
+        lp += float(_sp2.halfnorm.logpdf(H_star, scale=200.0))
+        lp += float(_sp2.uniform.logpdf(t0_val, 1.0, 119.0))
+        lp += float(_sp2.halfnorm.logpdf(sigma, scale=10.0))
+
+        # Likelihood
+        doy_pred = integrate_gdd_fast(T_daily_arr, T_base, H_star, int(round(t0_val)))
+        lp += float(np.sum(_sp2.norm.logpdf(doy_obs_arr, doy_pred, sigma)))
+        return lp
+
+    return log_prob
+
+
 # ── Session state init ────────────────────────────────────────────────────────
 
 for _k in ("ov_step", "mh_step", "hmc_step", "ppl_step", "mh_res", "hmc_res",
-           "ppl_samples", "glacier_ppl_res", "glacier_pymc_res"):
+           "ppl_samples", "pheno_ppl_res", "pheno_pymc_res"):
     if _k not in st.session_state:
         st.session_state[_k] = None if _k.endswith(("res", "samples")) else 0
 
@@ -549,9 +647,9 @@ for _k in ("ov_step", "mh_step", "hmc_step", "ppl_step", "mh_res", "hmc_res",
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab_ov, tab_mh, tab_hmc, tab_cmp, tab_ppl, tab_glacier = st.tabs([
+tab_ov, tab_mh, tab_hmc, tab_cmp, tab_ppl, tab_pheno = st.tabs([
     "Overview", "Metropolis-Hastings", "HMC & Leapfrog", "Comparison",
-    "🔧 Build a PPL", "🏔 Glacier Case Study",
+    "🔧 Build a PPL", "🌸 Wildflower Phenology",
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2051,291 +2149,363 @@ samples = mcmc.sample('metropolis', n_samples=3000, burn_in=1000)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GLACIER CASE STUDY TAB
+# WILDFLOWER PHENOLOGY TAB
 # ─────────────────────────────────────────────────────────────────────────────
-with tab_glacier:
-    st.header("Case Study — Sperry Glacier Mass Balance")
+with tab_pheno:
+    st.header("Case Study — Wildflower Phenology")
     st.markdown("""
-Glacier National Park's **Sperry Glacier** has been losing mass steadily since systematic
-monitoring began in 2005. We'll fit a simple physical ODE model to 21 years of real USGS
-mass-balance data using **(a) our PPL** and **(b) PyMC with NUTS**, then compare both
-posteriors side-by-side.
+Different wildflower species need different amounts of accumulated warmth before they bloom.
+We'll fit a **growing degree day (GDD) model** to 40 years of synthetic bloom observations,
+using **(a) our own PPL** and **(b) PyMC with NUTS**, then compare how well each sampler
+handles the correlated parameter posterior.
 """)
 
-    # ── Load data ──────────────────────────────────────────────────────────────
-    DATA_PATH = os.path.join(os.path.dirname(__file__), "Sperry_annual_mass_balance.csv")
+    # ── Load data once ─────────────────────────────────────────────────────────
+    T_daily_ph, doy_obs_ph, years_ph, true_params_ph = generate_phenology_data()
+    n_years_ph = len(years_ph)
 
-    @st.cache_data(show_spinner=False)
-    def load_sperry():
-        df = pd.read_csv(DATA_PATH)
-        years   = df["Year"].values.astype(int)
-        Ba      = df["Ba"].values.astype(float)   # annual balance (m w.e.) — OBSERVED
-        Bw      = df["Bw"].values.astype(float)   # winter balance  → P forcing
-        Bs      = df["Bs"].values.astype(float)   # summer balance  → T forcing
-        P_acc   = Bw                               # accumulation (m w.e./yr)
-        T_melt  = -Bs                              # melt index (m w.e./yr, positive)
-        return years, Ba, Bw, Bs, P_acc, T_melt
-
-    years_sp, Ba_sp, Bw_sp, Bs_sp, P_acc_sp, T_melt_sp = load_sperry()
-    n_years_sp = len(years_sp)
-
-    # ── ODE simulation ─────────────────────────────────────────────────────────
-    def glacier_ode(mu, c, T0, tau, V0, T_melt_arr, P_acc_arr):
-        """
-        Forward Euler integration of:
-          dV/dt = c·P(t) − μ·max(T_melt(t) − T₀, 0) − V(t)/τ
-        B_t = dV/dt  (specific mass balance in m w.e./yr)
-        """
-        n  = len(T_melt_arr)
-        V  = float(V0)
-        Bsim = np.zeros(n)
-        for t in range(n):
-            melt_t = float(mu) * max(float(T_melt_arr[t]) - float(T0), 0.0)
-            accum_t = float(c) * float(P_acc_arr[t])
-            dV_t   = accum_t - melt_t - V / float(tau)
-            Bsim[t] = dV_t
-            V += dV_t
-        return Bsim
-
-    # ── Section 1: The physical model ──────────────────────────────────────────
+    # ── Section 1: Physical model ──────────────────────────────────────────────
     with st.expander("📐 Section 1 — The physical model", expanded=True):
-        eL, eR = st.columns([1, 1])
-        with eL:
-            st.markdown("### The ODE")
-            st.latex(r"\frac{dV}{dt} = \underbrace{c \cdot P(t)}_{\text{accumulation}} - \underbrace{\mu \cdot \max(T(t) - T_0,\, 0)}_{\text{melt}} - \underbrace{\frac{V(t)}{\tau}}_{\text{calving/outflow}}")
+        s1L, s1R = st.columns([1, 1])
+        with s1L:
+            st.markdown("### The GDD model")
+            st.latex(r"\frac{dH}{dt} = \max\!\bigl(T(t) - T_{\text{base}},\; 0\bigr)")
             st.markdown("""
-**Observed variable:** Annual specific mass balance  B_t = dV/dt (m w.e./yr)
-
-**Known forcings** (derived from seasonal observations):
-- P(t) = winter mass balance Bw(t) — accumulation proxy (m w.e./yr)
-- T(t) = −summer mass balance |Bs(t)| — melt index (m w.e./yr)
-
-We integrate with forward Euler (dt = 1 yr), which is sufficient for this annual model.
+The plant accumulates **heat units** (growing degree days, GDD) on every day
+the temperature exceeds a base threshold $T_{\\text{base}}$.
+Bloom is triggered on the first day $t^*$ when total heat crosses the
+species-specific threshold $H^*$:
 """)
-        with eR:
-            st.markdown("### Parameters to infer")
+            st.latex(r"t^* = \min\bigl\{\,t : H(t) \ge H^*\bigr\}")
             st.markdown("""
-| Parameter | Description | Prior |
+We observe $t^*$ each year with a small amount of noise:
+""")
+            st.latex(r"\text{DOY}_y \;\sim\; \mathcal{N}\!\bigl(t^*_y(\theta),\;\sigma\bigr)")
+            st.markdown("""
+**Key point — threshold-crossing likelihood.**
+Unlike trajectory-fitting models (where you compare a whole curve),
+here the ODE produces **one number per year**: the day the heat crosses
+the threshold. The likelihood compares that scalar prediction to the
+observed first-bloom day. This structure is common in phenology, hydrology
+(streamflow timing), and any model where what you observe is an *event*.
+""")
+            st.markdown("### Parameters")
+            st.markdown("""
+| Parameter | Meaning | Prior |
 |---|---|---|
-| **μ** | Melt sensitivity (fraction of melt index that drives volume loss) | HalfNormal(1) |
-| **c** | Accumulation efficiency | HalfNormal(1) |
-| **T₀** | Melt threshold (m w.e./yr) | Normal(2, 1.5) |
-| **τ** | Volume response time (years) | Exponential(lam=1/20) |
-| **V₀** | Initial volume (m w.e. equivalent) | Normal(10, 5) |
-| **σ** | Observation noise (m w.e./yr) | HalfNormal(0.5) |
-
-We have **21 data points** (2005–2025) and **6 parameters** — a realistic,
-moderately constrained inference problem.  The parameters are correlated in the
-posterior, making MCMC the natural tool.
+| **T_base** | Base temperature below which no development occurs (°C) | Normal(2, 3) |
+| **H★** | Total heat units required to bloom (GDD) | HalfNormal(200) |
+| **t₀** | Day of year to start accumulating heat | Uniform(1, 120) |
+| **σ** | Observation noise (days) | HalfNormal(10) |
 """)
+
+        with s1R:
+            st.markdown("### Example: year 1980")
+            # Build example figure
+            tp = true_params_ph
+            T_ex = T_daily_ph[0]
+            gdd_ex = np.maximum(T_ex - tp["T_base"], 0.0)
+            gdd_ex[:int(tp["t0"])] = 0.0
+            H_cum_ex = np.cumsum(gdd_ex)
+            bloom_day_ex = int(np.argmax(H_cum_ex >= tp["H_star"]) + 1)
+
+            fig_ode_ph, (ax_t_ph, ax_h_ph) = plt.subplots(
+                2, 1, figsize=(7, 5), sharex=True)
+
+            days_plot = np.arange(1, 181)   # show first 180 days
+            ax_t_ph.plot(days_plot, T_ex[:180], color="steelblue", lw=1.5, label="T(t)")
+            ax_t_ph.axhline(tp["T_base"], color="gray", lw=1.2, ls="--",
+                            label=f"T_base = {tp['T_base']}°C")
+            ax_t_ph.axvline(tp["t0"], color="darkorange", lw=1.5, ls="--",
+                            label=f"t₀ = day {int(tp['t0'])}")
+            ax_t_ph.fill_between(days_plot,
+                                 tp["T_base"],
+                                 np.maximum(T_ex[:180], tp["T_base"]),
+                                 alpha=0.25, color="tomato", label="Daily GDD")
+            ax_t_ph.set_ylabel("Temperature (°C)", fontsize=9)
+            ax_t_ph.legend(fontsize=8, loc="upper left")
+            ax_t_ph.set_title("Step 1 — Daily temperature (1980)", fontsize=10)
+
+            ax_h_ph.plot(days_plot, H_cum_ex[:180], color="tomato", lw=2,
+                         label="H(t) — accumulated GDD")
+            ax_h_ph.axhline(tp["H_star"], color="green", lw=1.5, ls="--",
+                            label=f"H★ = {tp['H_star']} GDD")
+            ax_h_ph.axvline(tp["t0"], color="darkorange", lw=1.5, ls="--")
+            if bloom_day_ex <= 180:
+                ax_h_ph.axvline(bloom_day_ex, color="purple", lw=2,
+                                label=f"t★ = day {bloom_day_ex}  ← bloom!")
+            ax_h_ph.set_ylabel("Accumulated GDD", fontsize=9)
+            ax_h_ph.set_xlabel("Day of year", fontsize=9)
+            ax_h_ph.legend(fontsize=8, loc="upper left")
+            ax_h_ph.set_title("Step 2 — H(t) crosses H★ → bloom event", fontsize=10)
+            plt.tight_layout()
+            st.pyplot(fig_ode_ph)
+            plt.close(fig_ode_ph)
 
     # ── Section 2: The data ────────────────────────────────────────────────────
-    with st.expander("📊 Section 2 — The data (Sperry Glacier, USGS)", expanded=True):
-        fig_data_sp = make_subplots(rows=3, cols=1,
-            subplot_titles=["Accumulation forcing P(t) = Bw (m w.e./yr)",
-                            "Melt index T(t) = −Bs (m w.e./yr)",
-                            "Annual mass balance Ba — OBSERVED (m w.e./yr)"],
-            vertical_spacing=0.12)
-        fig_data_sp.add_trace(go.Bar(x=years_sp, y=P_acc_sp,
-                                     marker_color="steelblue", name="P(t) = Bw"), 1, 1)
-        fig_data_sp.add_trace(go.Bar(x=years_sp, y=T_melt_sp,
-                                     marker_color="tomato", name="T(t) = −Bs"), 2, 1)
-        fig_data_sp.add_trace(go.Bar(x=years_sp, y=Ba_sp,
-                                     marker_color=[C_GREEN if v >= 0 else C_RED for v in Ba_sp],
-                                     name="Ba (observed)"), 3, 1)
-        fig_data_sp.add_hline(y=0, line_dash="dash", line_color="gray", row=3, col=1)
-        fig_data_sp.add_hline(y=float(Ba_sp.mean()), line_dash="dot", line_color="black",
-                               annotation_text=f"mean={Ba_sp.mean():.2f}",
-                               annotation_position="bottom right", row=3, col=1)
-        fig_data_sp.update_layout(height=560, margin=dict(t=60, b=20),
-                                   showlegend=False,
-                                   title="Sperry Glacier, Glacier National Park MT — USGS data 2005–2025")
-        st.plotly_chart(fig_data_sp, use_container_width=True)
-        st.caption("Data: USGS Benchmark Glacier Program, doi:10.5066/F7HD7SRF, calibrated v10.0 (2026).")
+    with st.expander("📊 Section 2 — The data (synthetic, 1980–2019)", expanded=True):
+        d1, d2 = st.columns([3, 2])
 
-    # ── Section 3: PPL inference ───────────────────────────────────────────────
+        with d1:
+            st.markdown("**Spring temperature heatmap** (days 1–150, all years)")
+            T_spring = T_daily_ph[:, :150]
+            fig_hm = go.Figure(go.Heatmap(
+                z=T_spring,
+                x=list(range(1, 151)),
+                y=[str(y) for y in years_ph],
+                colorscale="RdBu_r",
+                colorbar=dict(title="°C", len=0.6),
+                zmin=-15, zmax=25,
+            ))
+            fig_hm.add_shape(type="line", x0=true_params_ph["t0"], x1=true_params_ph["t0"],
+                             y0=0, y1=1, xref="x", yref="paper",
+                             line=dict(color="black", width=1.5, dash="dot"))
+            fig_hm.add_annotation(x=true_params_ph["t0"], y=1.02, xref="x", yref="paper",
+                                  text="t₀", showarrow=False, font=dict(size=10))
+            fig_hm.update_layout(xaxis_title="Day of year", yaxis_title="Year",
+                                  height=380, margin=dict(t=30, b=40))
+            st.plotly_chart(fig_hm, use_container_width=True)
+
+        with d2:
+            st.markdown("**Observed first-bloom DOY**")
+            # Fit a trend line
+            p_trend = np.polyfit(years_ph - 1980, doy_obs_ph, 1)
+            trend_line = np.polyval(p_trend, years_ph - 1980)
+
+            fig_doy = go.Figure()
+            fig_doy.add_trace(go.Scatter(
+                x=years_ph, y=doy_obs_ph, mode="markers",
+                marker=dict(size=9, color=C_GREEN, line=dict(width=1, color="darkgreen")),
+                name="Observed DOY",
+            ))
+            fig_doy.add_trace(go.Scatter(
+                x=years_ph, y=trend_line, mode="lines",
+                line=dict(color="black", width=1.5, dash="dash"),
+                name=f"Trend ({p_trend[0]:+.2f} days/yr)",
+            ))
+            fig_doy.update_layout(xaxis_title="Year", yaxis_title="Bloom DOY",
+                                   height=220, margin=dict(t=10, b=30),
+                                   legend=dict(x=0.0, y=1.0))
+            st.plotly_chart(fig_doy, use_container_width=True)
+
+            st.markdown("**Histogram of bloom DOY**")
+            fig_hist_doy = go.Figure(go.Histogram(
+                x=doy_obs_ph, nbinsx=20,
+                marker_color=C_GREEN, opacity=0.8,
+            ))
+            fig_hist_doy.update_layout(xaxis_title="Bloom DOY",
+                                        yaxis_title="Count",
+                                        height=180, margin=dict(t=10, b=30))
+            st.plotly_chart(fig_hist_doy, use_container_width=True)
+
+        # Warming trend caption
+        st.caption(
+            f"Synthetic data: warming rate +0.03 °C/yr. "
+            f"True params: T_base={true_params_ph['T_base']} °C, "
+            f"H★={true_params_ph['H_star']} GDD, "
+            f"t₀=day {int(true_params_ph['t0'])}, σ={true_params_ph['sigma']} days."
+        )
+
+    # ── Section 3: PPL Metropolis ──────────────────────────────────────────────
     with st.expander("🔧 Section 3 — Fit with our PPL (Metropolis)", expanded=False):
-        p3L, p3R = st.columns([1, 2])
-        with p3L:
-            st.markdown("### Metropolis on the glacier posterior")
-            st.code("""\
-# Custom likelihood wrapping the ODE
-class GlacierLik:
-    def __init__(self, T_melt, P_acc, B_obs, vars):
-        self.T_melt = T_melt; self.P_acc = P_acc
-        self.B_obs  = B_obs;  self.vars  = vars
-    def log_prob(self, x):
-        v = self.vars
-        B_sim = glacier_ode(
-            v['mu'].value, v['c'].value, v['T0'].value,
-            v['tau'].value, v['V0'].value,
-            self.T_melt, self.P_acc)
-        sigma = v['sigma'].value
-        if sigma <= 0: return -np.inf
-        return float(np.sum(
-            sp.norm.logpdf(self.B_obs, B_sim, sigma)))
+        p3col, p3ctrl = st.columns([3, 1])
 
-# Build the model
-model = Model()
-mu_v  = model.add_variable('mu',    HalfNormal(1))
-c_v   = model.add_variable('c',     HalfNormal(1))
-T0_v  = model.add_variable('T0',    Normal(2, 1.5))
-tau_v = model.add_variable('tau',   Exponential(1/20))
-V0_v  = model.add_variable('V0',    Normal(10, 5))
-sg_v  = model.add_variable('sigma', HalfNormal(0.5))
-obs_v = model.add_variable('obs', GlacierLik(...),
-        parents=[mu_v,c_v,T0_v,tau_v,V0_v,sg_v],
-        observed=True)
-""", language="python")
-            ppl_gl_n    = st.slider("n_samples", 1000, 8000, 4000, 1000, key="gl_n")
-            ppl_gl_burn = st.slider("burn_in",    500, 3000, 2000,  500, key="gl_burn")
-            ppl_gl_std  = st.slider("proposal_std", 0.01, 0.20, 0.05, 0.01, key="gl_std")
-            run_ppl_gl  = st.button("Run PPL Metropolis", type="primary", key="gl_ppl_run")
+        with p3ctrl:
+            st.markdown("**Sampler settings**")
+            ph_n    = st.slider("n_samples", 2000, 15000, 6000, 1000, key="ph_n")
+            ph_burn = st.slider("burn_in",    500,  5000, 2000,  500, key="ph_burn")
+            st.markdown("**Per-parameter proposal σ**")
+            ph_std_Tb = st.slider("T_base",  0.1, 2.0, 0.4, 0.1, key="ph_sTb")
+            ph_std_Hs = st.slider("H_star",  1.0, 30.0, 8.0, 1.0, key="ph_sHs")
+            ph_std_t0 = st.slider("t0",       0.5, 8.0, 2.5, 0.5, key="ph_st0")
+            ph_std_sg = st.slider("sigma",    0.1, 2.0, 0.3, 0.1, key="ph_ssg")
+            run_ph_ppl = st.button("Run PPL Metropolis",
+                                   type="primary", key="ph_run_ppl")
 
-        with p3R:
-            if run_ppl_gl:
-                import scipy.stats as _sp2
+        with p3col:
+            st.markdown("""
+### Building the likelihood
 
-                class _GlacierLik:
-                    def __init__(self, T_melt, P_acc, B_obs, vdict):
-                        self.T_melt = T_melt; self.P_acc = P_acc
-                        self.B_obs = B_obs;   self.vdict = vdict
-                    def log_prob(self, x):
-                        v = self.vdict
-                        try:
-                            mu_val  = v["mu"].value
-                            c_val   = v["c"].value
-                            T0_val  = v["T0"].value
-                            tau_val = v["tau"].value
-                            V0_val  = v["V0"].value
-                            sg_val  = v["sigma"].value
-                            if sg_val is None or sg_val <= 0: return -np.inf
-                            if tau_val is None or tau_val <= 0: return -np.inf
-                            B_sim = glacier_ode(mu_val, c_val, T0_val, tau_val, V0_val,
-                                                self.T_melt, self.P_acc)
-                            return float(np.sum(_sp2.norm.logpdf(self.B_obs, B_sim, sg_val)))
-                        except Exception:
-                            return -np.inf
+The ODE integration step is just a Python function that we wrap in our custom
+`log_prob`:
 
-                m_gl   = _ppl.Model()
-                mu_gl  = m_gl.add_variable("mu",    _ppl.HalfNormal(1.0))
-                c_gl   = m_gl.add_variable("c",     _ppl.HalfNormal(1.0))
-                T0_gl  = m_gl.add_variable("T0",    _ppl.Normal(2.0, 1.5))
-                tau_gl = m_gl.add_variable("tau",   _ppl.Exponential(rate=1.0/20.0))
-                V0_gl  = m_gl.add_variable("V0",    _ppl.Normal(10.0, 5.0))
-                sg_gl  = m_gl.add_variable("sigma", _ppl.HalfNormal(0.5))
-                vdict  = {"mu": mu_gl, "c": c_gl, "T0": T0_gl,
-                          "tau": tau_gl, "V0": V0_gl, "sigma": sg_gl}
-                m_gl.add_variable("obs", _GlacierLik(T_melt_sp, P_acc_sp, Ba_sp, vdict),
-                                   parents=list(vdict.values()), observed=True, observed_data=Ba_sp)
+```python
+def make_log_prob(doy_obs, T_daily):
+    def log_prob(state):
+        T_base = state["T_base"];  H_star = state["H_star"]
+        t0     = state["t0"];      sigma  = state["sigma"]
+        if sigma <= 0 or H_star <= 0 or t0 < 1 or t0 > 120:
+            return -np.inf
+        # Priors
+        lp  = sp.norm.logpdf(T_base, 2, 3)
+        lp += sp.halfnorm.logpdf(H_star, scale=200)
+        lp += sp.uniform.logpdf(t0, 1, 119)
+        lp += sp.halfnorm.logpdf(sigma, scale=10)
+        # Likelihood — ODE gives one predicted DOY per year
+        doy_pred = integrate_gdd(T_daily, T_base, H_star, int(round(t0)))
+        lp += np.sum(sp.norm.logpdf(doy_obs, doy_pred, sigma))
+        return lp
+    return log_prob
 
-                init_gl = {"mu": 0.80, "c": 0.58, "T0": 2.0, "tau": 20.0, "V0": 10.0, "sigma": 0.4}
-                mc_gl = _ppl.MCMC(m_gl, initial_state=init_gl, proposal_std=float(ppl_gl_std))
-                with st.spinner(f"Running Metropolis on glacier model ({int(ppl_gl_n)} samples)…"):
-                    samps_gl = mc_gl.sample("metropolis", int(ppl_gl_n), int(ppl_gl_burn))
+# Per-parameter proposal widths (parameters live on very different scales)
+sampler = DirectMCMC(
+    log_prob_fn   = make_log_prob(doy_obs, T_daily),
+    initial_state = {"T_base": 2.0, "H_star": 200.0,
+                     "t0": 60.0, "sigma": 5.0},
+    proposal_std  = {"T_base": 0.4, "H_star": 8.0,
+                     "t0": 2.5, "sigma": 0.3},
+)
+chain = sampler.sample(n_samples=6000, burn_in=2000)
+```
+""")
 
-                st.session_state["glacier_ppl_res"] = dict(
-                    samples=samps_gl, rate=mc_gl.acceptance_rate)
+            if run_ph_ppl:
+                log_prob_ph = make_log_prob_pheno(doy_obs_ph, T_daily_ph)
+                prop_widths = {
+                    "T_base": float(ph_std_Tb),
+                    "H_star": float(ph_std_Hs),
+                    "t0":     float(ph_std_t0),
+                    "sigma":  float(ph_std_sg),
+                }
+                init_ph = {"T_base": 2.0, "H_star": 200.0, "t0": 60.0, "sigma": 5.0}
+                dc_ph = _ppl.DirectMCMC(log_prob_ph, init_ph, prop_widths)
+                with st.spinner(f"Running Metropolis ({int(ph_n)} samples)…"):
+                    chain_ph = dc_ph.sample(int(ph_n), int(ph_burn))
+                st.session_state["pheno_ppl_res"] = dict(
+                    chain=chain_ph, rate=dc_ph.acceptance_rate)
 
-            res_gl = st.session_state["glacier_ppl_res"]
-            if res_gl:
-                st.metric("Acceptance rate", f"{res_gl['rate']:.1%}")
-                sgl = res_gl["samples"]
-                gl_params = ["mu", "c", "T0", "tau", "V0", "sigma"]
-                gl_chains = {k: np.array([s[k] for s in sgl]) for k in gl_params}
+        res_ph = st.session_state["pheno_ppl_res"]
+        if res_ph:
+            ch_ph = res_ph["chain"]
+            st.metric("Acceptance rate", f"{res_ph['rate']:.1%}")
 
-                # Posterior means summary
-                st.markdown("**Posterior means:**")
-                pm_cols = st.columns(len(gl_params))
-                for i, k in enumerate(gl_params):
-                    pm_cols[i].metric(k, f"{gl_chains[k].mean():.3f}",
-                                       delta=f"±{gl_chains[k].std():.3f}")
+            ph_keys   = ["T_base", "H_star", "t0", "sigma"]
+            ph_chains = {k: np.array([s[k] for s in ch_ph]) for k in ph_keys}
+            ph_colors = [C_BLUE, C_RED, C_ORANGE, C_GREEN]
 
-                # Trace + histogram for each
-                fig_gl_diag, axes_gl = plt.subplots(2, 3, figsize=(13, 6))
-                fig_gl_diag.suptitle("PPL Metropolis — Glacier Posterior", fontsize=12, fontweight="bold")
-                colors_gl = [C_BLUE, C_ORANGE, C_GREEN, C_RED, "#9467bd", "#8c564b"]
-                for idx, k in enumerate(gl_params):
-                    r, c2 = divmod(idx, 3)
-                    axes_gl[r, c2].plot(gl_chains[k], lw=0.5, color=colors_gl[idx], alpha=0.8)
-                    axes_gl[r, c2].set_title(f"{k}  mean={gl_chains[k].mean():.3f}", fontsize=9)
-                plt.tight_layout()
-                st.pyplot(fig_gl_diag)
-                plt.close(fig_gl_diag)
+            # Trace + histogram grid
+            fig_ph_diag, axes_ph = plt.subplots(2, 4, figsize=(14, 5))
+            fig_ph_diag.suptitle("PPL Metropolis — Phenology Posterior",
+                                  fontsize=12, fontweight="bold")
+            for idx, k in enumerate(ph_keys):
+                ch = ph_chains[k]
+                col = ph_colors[idx]
+                true_v = true_params_ph[k]
 
-                # Posterior predictive retrodiction
-                np.random.seed(0)
-                B_post_pred = np.array([
-                    glacier_ode(s["mu"], s["c"], s["T0"], s["tau"], s["V0"], T_melt_sp, P_acc_sp)
-                    for s in sgl[::max(1, len(sgl)//200)]
-                ])
-                Bpp_lo = np.percentile(B_post_pred, 5, axis=0)
-                Bpp_hi = np.percentile(B_post_pred, 95, axis=0)
-                Bpp_md = np.percentile(B_post_pred, 50, axis=0)
+                axes_ph[0, idx].plot(ch, lw=0.4, color=col, alpha=0.8)
+                axes_ph[0, idx].axhline(true_v, color="red", lw=1.2,
+                                         ls="--", label="true")
+                axes_ph[0, idx].set_title(f"{k}  (true={true_v})", fontsize=9)
+                axes_ph[0, idx].legend(fontsize=7)
 
-                fig_ret = go.Figure()
-                fig_ret.add_trace(go.Scatter(x=np.concatenate([years_sp, years_sp[::-1]]),
-                                              y=np.concatenate([Bpp_hi, Bpp_lo[::-1]]),
-                                              fill="toself", fillcolor="rgba(99,110,250,0.2)",
-                                              line=dict(color="rgba(0,0,0,0)"), name="90% CI"))
-                fig_ret.add_trace(go.Scatter(x=years_sp, y=Bpp_md, mode="lines",
-                                              line=dict(color=C_BLUE, width=2), name="Posterior median"))
-                fig_ret.add_trace(go.Scatter(x=years_sp, y=Ba_sp, mode="markers",
-                                              marker=dict(size=10, color="black", symbol="x"),
-                                              name="Observed Ba"))
-                fig_ret.update_layout(title="Posterior predictive retrodiction — PPL",
-                                       xaxis_title="Year", yaxis_title="B (m w.e./yr)",
-                                       height=340, margin=dict(t=50, b=20))
-                st.plotly_chart(fig_ret, use_container_width=True)
-            else:
-                st.info("Click **Run PPL Metropolis** to fit the model.")
+                axes_ph[1, idx].hist(ch, bins=50, color=col, alpha=0.7,
+                                      density=True)
+                axes_ph[1, idx].axvline(true_v, color="red", lw=1.5, ls="--")
+                axes_ph[1, idx].axvline(ch.mean(), color="black", lw=1.5,
+                                         label=f"mean={ch.mean():.2f}")
+                axes_ph[1, idx].set_title(f"{k} posterior", fontsize=9)
+                axes_ph[1, idx].legend(fontsize=7)
 
-    # ── Section 4: PyMC inference ──────────────────────────────────────────────
-    with st.expander("⚡ Section 4 — Fit with PyMC (NUTS)", expanded=False):
-        p4L, p4R = st.columns([1, 2])
-        with p4L:
-            st.markdown("### The same model in PyMC")
-            st.code("""\
-import pymc as pm
-import pytensor.tensor as pt
+            plt.tight_layout()
+            st.pyplot(fig_ph_diag)
+            plt.close(fig_ph_diag)
 
-with pm.Model() as pymc_model:
-    # Priors (same as PPL model)
-    mu_pm    = pm.HalfNormal('mu',    sigma=1.0)
-    c_pm     = pm.HalfNormal('c',     sigma=1.0)
-    T0_pm    = pm.Normal('T0',    mu=2, sigma=1.5)
-    tau_pm   = pm.Exponential('tau',  lam=1/20)
-    V0_pm    = pm.Normal('V0',    mu=10, sigma=5)
-    sigma_pm = pm.HalfNormal('sigma', sigma=0.5)
+            # Posterior predictive
+            np.random.seed(0)
+            idx_pp = np.random.choice(len(ch_ph), min(300, len(ch_ph)), replace=False)
+            doy_pp = np.array([
+                integrate_gdd_fast(T_daily_ph,
+                                   ch_ph[i]["T_base"], ch_ph[i]["H_star"],
+                                   int(round(ch_ph[i]["t0"])))
+                for i in idx_pp
+            ])
+            doy_lo = np.percentile(doy_pp, 5, axis=0)
+            doy_hi = np.percentile(doy_pp, 95, axis=0)
+            doy_md = np.percentile(doy_pp, 50, axis=0)
 
-    # Forward Euler ODE using pytensor ops
-    # Python loop builds the computational graph once
-    T_pt = pt.as_tensor_variable(T_melt)
-    P_pt = pt.as_tensor_variable(P_acc)
-    V_curr = V0_pm
-    B_list = []
-    for t in range(n_years):
-        melt_t  = mu_pm * pt.maximum(T_pt[t] - T0_pm, 0.0)
-        accum_t = c_pm  * P_pt[t]
-        dV_t    = accum_t - melt_t - V_curr / tau_pm
-        B_list.append(dV_t)
-        V_curr  = V_curr + dV_t
-    B_sim_pt = pt.stack(B_list)
+            fig_ppc_ph = go.Figure()
+            fig_ppc_ph.add_trace(go.Scatter(
+                x=np.concatenate([years_ph, years_ph[::-1]]),
+                y=np.concatenate([doy_hi, doy_lo[::-1]]),
+                fill="toself", fillcolor="rgba(99,110,250,0.2)",
+                line=dict(color="rgba(0,0,0,0)"), name="90% CI"))
+            fig_ppc_ph.add_trace(go.Scatter(
+                x=years_ph, y=doy_md, mode="lines",
+                line=dict(color=C_BLUE, width=2), name="Posterior median"))
+            fig_ppc_ph.add_trace(go.Scatter(
+                x=years_ph, y=doy_obs_ph, mode="markers",
+                marker=dict(size=9, color="black", symbol="x"), name="Observed"))
+            fig_ppc_ph.update_layout(
+                title="Posterior predictive retrodiction — PPL Metropolis",
+                xaxis_title="Year", yaxis_title="Bloom DOY",
+                height=320, margin=dict(t=50, b=20))
+            st.plotly_chart(fig_ppc_ph, use_container_width=True)
 
-    # Likelihood
-    pm.Normal('B_obs', mu=B_sim_pt, sigma=sigma_pm,
-              observed=B_obs)
+        else:
+            st.info("Configure the sampler and click **Run PPL Metropolis**.")
 
-    # NUTS (No U-Turn Sampler)
-    trace = pm.sample(1000, tune=1000, target_accept=0.9,
-                      progressbar=False, chains=2)
-""", language="python")
-            pymc_n    = st.slider("Draws per chain", 500, 2000, 1000, 250, key="gl_pymc_n")
-            pymc_tune = st.slider("Tuning steps",    500, 2000, 1000, 250, key="gl_pymc_tune")
-            run_pymc  = st.button("Run PyMC NUTS", type="primary", key="gl_pymc_run")
+    # ── Section 4: PyMC NUTS ───────────────────────────────────────────────────
+    with st.expander("⚡ Section 4 — Fit with PyMC (NUTS, soft threshold)", expanded=False):
+        p4col, p4ctrl = st.columns([3, 1])
 
-        with p4R:
-            if run_pymc:
+        with p4ctrl:
+            st.markdown("**Sampler settings**")
+            pymc_draws = st.slider("Draws per chain", 500, 2000, 1000, 250,
+                                    key="ph_pymc_draws")
+            pymc_tune  = st.slider("Tuning steps",    500, 2000, 1000, 250,
+                                    key="ph_pymc_tune")
+            run_ph_pymc = st.button("Run PyMC NUTS",
+                                    type="primary", key="ph_run_pymc")
+
+        with p4col:
+            st.markdown("""
+### The soft-threshold trick
+
+NUTS needs **gradients**, but "find the first crossing" is a hard
+step function that has zero gradient almost everywhere. We replace it
+with a **differentiable soft approximation**:
+
+1. **Soft t₀ mask** — instead of zeroing days before t₀, weight them
+   with a sigmoid: days near t₀ contribute partially.
+2. **Soft threshold crossing** — instead of an exact step, model the
+   probability of having crossed H★ by day d as a sigmoid.
+3. **Expected DOY** — sum d × P(bloom on day d) to get a smooth scalar.
+
+```python
+def predict_bloom_soft(T_base, H_star, t0, T_pt):
+    # Soft t0 mask
+    days   = pt.arange(365, dtype="float64")
+    mask   = pt.sigmoid(days[None, :] - t0)        # (1, 365)
+    heat   = pt.maximum(T_pt - T_base, 0.0) * mask # (N, 365)
+    H_cum  = pt.cumsum(heat, axis=1)                # (N, 365)
+
+    # Soft threshold: probability of having bloomed by day d
+    p_crossed = pt.sigmoid(0.1 * (H_cum - H_star))
+
+    # Probability of blooming on exactly day d
+    p_prev  = pt.concatenate(
+        [pt.zeros_like(p_crossed[:, :1]), p_crossed[:, :-1]], axis=1)
+    p_daily = p_crossed - p_prev  # (N, 365)
+
+    # Expected bloom DOY
+    days_1 = pt.arange(1, 366, dtype="float64")[None, :]
+    return pt.sum(p_daily * days_1, axis=1)         # (N,)
+```
+
+The model and likelihood are then standard PyMC:
+```python
+with pm.Model():
+    T_base = pm.Normal("T_base", mu=2, sigma=3)
+    H_star = pm.HalfNormal("H_star", sigma=200)
+    t0     = pm.Uniform("t0", lower=1, upper=120)
+    sigma  = pm.HalfNormal("sigma", sigma=10)
+    doy_mu = predict_bloom_soft(T_base, H_star, t0, T_pt)
+    pm.Normal("doy_obs", mu=doy_mu, sigma=sigma, observed=doy_obs)
+    idata = pm.sample(draws=1000, tune=1000, target_accept=0.9)
+```
+""")
+
+            if run_ph_pymc:
                 try:
                     import pymc as pm
                     import pytensor.tensor as pt
@@ -2344,173 +2514,225 @@ with pm.Model() as pymc_model:
                     logging.getLogger("pymc").setLevel(logging.ERROR)
                     warnings.filterwarnings("ignore")
 
-                    T_melt_np = T_melt_sp.astype("float64")
-                    P_acc_np  = P_acc_sp.astype("float64")
-                    B_obs_np  = Ba_sp.astype("float64")
-                    ny        = n_years_sp
+                    T_pt_np = T_daily_ph.astype("float64")
+                    doy_np  = doy_obs_ph.astype("float64")
 
-                    with pm.Model() as pm_model:
-                        mu_pm    = pm.HalfNormal("mu",    sigma=1.0)
-                        c_pm     = pm.HalfNormal("c",     sigma=1.0)
-                        T0_pm    = pm.Normal("T0",    mu=2.0, sigma=1.5)
-                        tau_pm   = pm.Exponential("tau",  lam=1.0/20.0)
-                        V0_pm    = pm.Normal("V0",    mu=10.0, sigma=5.0)
-                        sigma_pm = pm.HalfNormal("sigma", sigma=0.5)
+                    with pm.Model() as pm_pheno:
+                        T_base_pm = pm.Normal("T_base", mu=2.0,  sigma=3.0)
+                        H_star_pm = pm.HalfNormal("H_star",       sigma=200.0)
+                        t0_pm     = pm.Uniform("t0",   lower=1.0, upper=120.0)
+                        sigma_pm  = pm.HalfNormal("sigma",         sigma=10.0)
 
-                        T_pt = pt.as_tensor_variable(T_melt_np)
-                        P_pt = pt.as_tensor_variable(P_acc_np)
-                        V_curr = V0_pm
-                        B_list_pt = []
-                        for t in range(ny):
-                            melt_t  = mu_pm * pt.maximum(T_pt[t] - T0_pm, 0.0)
-                            accum_t = c_pm  * P_pt[t]
-                            dV_t    = accum_t - melt_t - V_curr / tau_pm
-                            B_list_pt.append(dV_t)
-                            V_curr  = V_curr + dV_t
-                        B_sim_pt = pt.stack(B_list_pt)
+                        T_pt = pt.as_tensor_variable(T_pt_np)
+                        days_pt = pt.arange(365, dtype="float64")
+                        mask    = pt.sigmoid(days_pt[None, :] - t0_pm)
+                        heat    = pt.maximum(T_pt - T_base_pm, 0.0) * mask
+                        H_cum   = pt.cumsum(heat, axis=1)
+                        p_crossed = pt.sigmoid(0.1 * (H_cum - H_star_pm))
+                        p_prev  = pt.concatenate(
+                            [pt.zeros_like(p_crossed[:, :1]), p_crossed[:, :-1]], axis=1)
+                        p_daily = p_crossed - p_prev
+                        days_1  = pt.arange(1, 366, dtype="float64")[None, :]
+                        doy_mu  = pt.sum(p_daily * days_1, axis=1)
 
-                        pm.Normal("B_obs", mu=B_sim_pt, sigma=sigma_pm, observed=B_obs_np)
+                        pm.Normal("doy_obs", mu=doy_mu, sigma=sigma_pm,
+                                  observed=doy_np)
 
-                        with st.spinner(f"Running PyMC NUTS ({int(pymc_n)} draws, {int(pymc_tune)} tune)…"):
-                            trace_pm = pm.sample(int(pymc_n), tune=int(pymc_tune),
-                                                  target_accept=0.9, progressbar=False,
-                                                  chains=2, cores=1,
-                                                  return_inferencedata=True)
+                        with st.spinner(
+                            f"Running PyMC NUTS ({int(pymc_draws)} draws, "
+                            f"{int(pymc_tune)} tune, 2 chains)…"
+                        ):
+                            idata_ph = pm.sample(
+                                int(pymc_draws), tune=int(pymc_tune),
+                                target_accept=0.9, chains=2, cores=1,
+                                progressbar=False,
+                                return_inferencedata=True,
+                            )
 
-                    st.session_state["glacier_pymc_res"] = dict(trace=trace_pm)
+                    st.session_state["pheno_pymc_res"] = dict(idata=idata_ph)
 
-                except Exception as e:
-                    st.error(f"PyMC error: {e}")
+                except Exception as exc:
+                    st.error(f"PyMC error: {exc}")
 
-            res_pm = st.session_state["glacier_pymc_res"]
-            if res_pm:
-                import arviz as az
-                trace_pm = res_pm["trace"]
-                param_names_pm = ["mu", "c", "T0", "tau", "V0", "sigma"]
+        res_pm_ph = st.session_state["pheno_pymc_res"]
+        if res_pm_ph:
+            import arviz as az
+            idata_ph2 = res_pm_ph["idata"]
+            pm_keys   = ["T_base", "H_star", "t0", "sigma"]
 
-                st.markdown("### ArviZ summary")
-                summary_df = az.summary(trace_pm, var_names=param_names_pm)
-                st.dataframe(summary_df.style.format("{:.3f}"), use_container_width=True)
+            # ArviZ summary with true values alongside
+            st.markdown("### ArviZ posterior summary")
+            summ_df = az.summary(idata_ph2, var_names=pm_keys)
+            # Append true values column
+            summ_df.insert(0, "true", [true_params_ph[k] for k in pm_keys])
+            st.dataframe(summ_df.style.format("{:.3f}"), use_container_width=True)
 
-                st.markdown("### Posterior distributions (NUTS)")
-                fig_az, axes_az = plt.subplots(2, 3, figsize=(13, 6))
-                fig_az.suptitle("PyMC NUTS — Glacier Posterior", fontsize=12, fontweight="bold")
-                colors_az = [C_BLUE, C_ORANGE, C_GREEN, C_RED, "#9467bd", "#8c564b"]
-                for idx, k in enumerate(param_names_pm):
-                    r, c2 = divmod(idx, 3)
-                    chain_az = trace_pm.posterior[k].values.flatten()
-                    axes_az[r, c2].hist(chain_az, bins=50, color=colors_az[idx],
-                                         alpha=0.7, density=True)
-                    axes_az[r, c2].axvline(chain_az.mean(), color="black", lw=1.5,
-                                            label=f"mean={chain_az.mean():.3f}")
-                    axes_az[r, c2].set_title(k, fontsize=10)
-                    axes_az[r, c2].legend(fontsize=7)
-                plt.tight_layout()
-                st.pyplot(fig_az)
-                plt.close(fig_az)
+            # Posterior histograms
+            fig_pm_hist, axes_pm = plt.subplots(1, 4, figsize=(14, 3.5))
+            fig_pm_hist.suptitle("PyMC NUTS — Phenology Posterior",
+                                  fontsize=11, fontweight="bold")
+            for idx, k in enumerate(pm_keys):
+                arr = idata_ph2.posterior[k].values.flatten()
+                tv  = true_params_ph[k]
+                axes_pm[idx].hist(arr, bins=50, color=ph_colors[idx],
+                                   alpha=0.7, density=True)
+                axes_pm[idx].axvline(tv, color="red", lw=1.5, ls="--",
+                                      label=f"true={tv}")
+                axes_pm[idx].axvline(arr.mean(), color="black", lw=1.5,
+                                      label=f"mean={arr.mean():.2f}")
+                axes_pm[idx].set_title(k, fontsize=10)
+                axes_pm[idx].legend(fontsize=7)
+            plt.tight_layout()
+            st.pyplot(fig_pm_hist)
+            plt.close(fig_pm_hist)
 
-                # Posterior predictive retrodiction
-                mu_az  = trace_pm.posterior["mu"].values.flatten()
-                c_az   = trace_pm.posterior["c"].values.flatten()
-                T0_az  = trace_pm.posterior["T0"].values.flatten()
-                tau_az = trace_pm.posterior["tau"].values.flatten()
-                V0_az  = trace_pm.posterior["V0"].values.flatten()
-                idx_samp = np.random.choice(len(mu_az), 200, replace=False)
-                B_ppc = np.array([
-                    glacier_ode(mu_az[i], c_az[i], T0_az[i], tau_az[i], V0_az[i],
-                                T_melt_sp, P_acc_sp)
-                    for i in idx_samp
-                ])
-                Bppc_lo = np.percentile(B_ppc, 5, axis=0)
-                Bppc_hi = np.percentile(B_ppc, 95, axis=0)
-                Bppc_md = np.percentile(B_ppc, 50, axis=0)
+            # Posterior predictive retrodiction
+            T_base_pm_s = idata_ph2.posterior["T_base"].values.flatten()
+            H_star_pm_s = idata_ph2.posterior["H_star"].values.flatten()
+            t0_pm_s     = idata_ph2.posterior["t0"].values.flatten()
+            idx_rtr = np.random.choice(len(T_base_pm_s), 300, replace=False)
+            doy_rtr = np.array([
+                integrate_gdd_fast(T_daily_ph,
+                                   T_base_pm_s[i], H_star_pm_s[i],
+                                   int(round(t0_pm_s[i])))
+                for i in idx_rtr
+            ])
+            rtr_lo = np.percentile(doy_rtr, 5,  axis=0)
+            rtr_hi = np.percentile(doy_rtr, 95, axis=0)
+            rtr_md = np.percentile(doy_rtr, 50, axis=0)
 
-                fig_ret2 = go.Figure()
-                fig_ret2.add_trace(go.Scatter(
-                    x=np.concatenate([years_sp, years_sp[::-1]]),
-                    y=np.concatenate([Bppc_hi, Bppc_lo[::-1]]),
-                    fill="toself", fillcolor="rgba(239,85,59,0.2)",
-                    line=dict(color="rgba(0,0,0,0)"), name="90% CI"))
-                fig_ret2.add_trace(go.Scatter(x=years_sp, y=Bppc_md, mode="lines",
-                                               line=dict(color=C_RED, width=2), name="Posterior median"))
-                fig_ret2.add_trace(go.Scatter(x=years_sp, y=Ba_sp, mode="markers",
-                                               marker=dict(size=10, color="black", symbol="x"),
-                                               name="Observed Ba"))
-                fig_ret2.update_layout(title="Posterior predictive retrodiction — PyMC NUTS",
-                                        xaxis_title="Year", yaxis_title="B (m w.e./yr)",
-                                        height=340, margin=dict(t=50, b=20))
-                st.plotly_chart(fig_ret2, use_container_width=True)
-            else:
-                st.info("Click **Run PyMC NUTS** to fit the model.")
+            fig_rtr = go.Figure()
+            fig_rtr.add_trace(go.Scatter(
+                x=np.concatenate([years_ph, years_ph[::-1]]),
+                y=np.concatenate([rtr_hi, rtr_lo[::-1]]),
+                fill="toself", fillcolor="rgba(239,85,59,0.2)",
+                line=dict(color="rgba(0,0,0,0)"), name="90% CI"))
+            fig_rtr.add_trace(go.Scatter(
+                x=years_ph, y=rtr_md, mode="lines",
+                line=dict(color=C_RED, width=2), name="Posterior median"))
+            fig_rtr.add_trace(go.Scatter(
+                x=years_ph, y=doy_obs_ph, mode="markers",
+                marker=dict(size=9, color="black", symbol="x"), name="Observed"))
+            fig_rtr.update_layout(
+                title="Posterior predictive retrodiction — PyMC NUTS",
+                xaxis_title="Year", yaxis_title="Bloom DOY",
+                height=300, margin=dict(t=50, b=20))
+            st.plotly_chart(fig_rtr, use_container_width=True)
+
+            # Pair plot — T_base vs H_star
+            st.markdown("### T_base vs H_star — posterior correlation")
+            st.markdown("""
+These two parameters trade off: if $T_{\\text{base}}$ is higher, each day
+contributes less heat, so $H^\\star$ must be **lower** to bloom at the same time.
+NUTS handles this negative correlation naturally via gradient information.
+Metropolis, which proposes each parameter independently, struggles.
+""")
+            fig_pair = go.Figure()
+            fig_pair.add_trace(go.Scatter(
+                x=T_base_pm_s[::2], y=H_star_pm_s[::2],
+                mode="markers",
+                marker=dict(size=3, opacity=0.3, color=C_RED),
+                name="Posterior samples"))
+            fig_pair.add_trace(go.Scatter(
+                x=[true_params_ph["T_base"]], y=[true_params_ph["H_star"]],
+                mode="markers",
+                marker=dict(size=16, color="black", symbol="cross"),
+                name="True values"))
+            fig_pair.update_layout(
+                xaxis_title="T_base (°C)", yaxis_title="H★ (GDD)",
+                title="Posterior correlation — negative trade-off between T_base and H★",
+                height=340, margin=dict(t=60, b=30))
+            st.plotly_chart(fig_pair, use_container_width=True)
+
+        else:
+            st.info("Click **Run PyMC NUTS** to fit the model.")
 
     # ── Section 5: Comparison ──────────────────────────────────────────────────
     with st.expander("⚖️ Section 5 — Compare both samplers", expanded=False):
-        res_ppl_c  = st.session_state["glacier_ppl_res"]
-        res_pymc_c = st.session_state["glacier_pymc_res"]
+        res_ppl_cmp  = st.session_state["pheno_ppl_res"]
+        res_pymc_cmp = st.session_state["pheno_pymc_res"]
 
-        if res_ppl_c and res_pymc_c:
+        if res_ppl_cmp and res_pymc_cmp:
             import arviz as az
-            st.markdown("### Posterior violin plots — PPL Metropolis vs PyMC NUTS")
-            sgl_c = res_ppl_c["samples"]
-            trace_c = res_pymc_c["trace"]
-            compare_params = ["mu", "c", "T0", "tau"]
+            ph_keys_cmp = ["T_base", "H_star", "t0", "sigma"]
 
-            fig_viol, axes_v = plt.subplots(1, len(compare_params), figsize=(13, 5))
-            fig_viol.suptitle("PPL Metropolis (blue) vs PyMC NUTS (red) — posterior marginals",
-                               fontsize=11, fontweight="bold")
-            for idx, k in enumerate(compare_params):
-                ppl_ch  = np.array([s[k] for s in sgl_c])
-                pymc_ch = trace_c.posterior[k].values.flatten()
-                ax_v = axes_v[idx]
-                parts = ax_v.violinplot([ppl_ch, pymc_ch], positions=[0, 1],
-                                         showmedians=True, showextrema=False)
-                parts["bodies"][0].set_facecolor(C_BLUE); parts["bodies"][0].set_alpha(0.6)
-                parts["bodies"][1].set_facecolor(C_RED);  parts["bodies"][1].set_alpha(0.6)
-                ax_v.set_xticks([0, 1]); ax_v.set_xticklabels(["PPL\nMetropolis", "PyMC\nNUTS"])
-                ax_v.set_title(k, fontsize=10)
+            st.markdown("### Posterior violin plots")
+            ch_cmp   = res_ppl_cmp["chain"]
+            idata_cmp = res_pymc_cmp["idata"]
+
+            fig_viol_ph, axes_viol = plt.subplots(1, 4, figsize=(14, 5))
+            fig_viol_ph.suptitle(
+                "PPL Metropolis (blue) vs PyMC NUTS (red) — posterior marginals",
+                fontsize=11, fontweight="bold")
+            for idx, k in enumerate(ph_keys_cmp):
+                ppl_arr  = np.array([s[k] for s in ch_cmp])
+                nuts_arr = idata_cmp.posterior[k].values.flatten()
+                tv       = true_params_ph[k]
+
+                parts = axes_viol[idx].violinplot(
+                    [ppl_arr, nuts_arr], positions=[0, 1],
+                    showmedians=True, showextrema=False)
+                parts["bodies"][0].set_facecolor(C_BLUE)
+                parts["bodies"][0].set_alpha(0.55)
+                parts["bodies"][1].set_facecolor(C_RED)
+                parts["bodies"][1].set_alpha(0.55)
+                axes_viol[idx].axhline(tv, color="black", lw=1.5,
+                                        ls="--", label=f"true={tv}")
+                axes_viol[idx].set_xticks([0, 1])
+                axes_viol[idx].set_xticklabels(["PPL\nMetropolis", "PyMC\nNUTS"])
+                axes_viol[idx].set_title(k, fontsize=10)
+                axes_viol[idx].legend(fontsize=7)
             plt.tight_layout()
-            st.pyplot(fig_viol)
-            plt.close(fig_viol)
+            st.pyplot(fig_viol_ph)
+            plt.close(fig_viol_ph)
 
-            st.markdown("### Side-by-side posterior means")
-            cmp_data = {}
-            for k in compare_params:
-                ppl_v  = np.array([s[k] for s in sgl_c])
-                pymc_v = trace_c.posterior[k].values.flatten()
-                cmp_data[k] = {
-                    "PPL mean": round(float(ppl_v.mean()), 3),
-                    "PPL std":  round(float(ppl_v.std()),  3),
-                    "NUTS mean": round(float(pymc_v.mean()), 3),
-                    "NUTS std":  round(float(pymc_v.std()),  3),
+            st.markdown("### Numerical comparison")
+            cmp_rows = {}
+            for k in ph_keys_cmp:
+                ppl_v  = np.array([s[k] for s in ch_cmp])
+                nuts_v = idata_cmp.posterior[k].values.flatten()
+                cmp_rows[k] = {
+                    "True":       round(true_params_ph[k], 3),
+                    "PPL mean":   round(float(ppl_v.mean()),  3),
+                    "PPL std":    round(float(ppl_v.std()),   3),
+                    "NUTS mean":  round(float(nuts_v.mean()), 3),
+                    "NUTS std":   round(float(nuts_v.std()),  3),
                 }
-            st.dataframe(pd.DataFrame(cmp_data).T, use_container_width=True)
+            st.dataframe(pd.DataFrame(cmp_rows).T, use_container_width=True)
 
             st.markdown("""
-### What did each sampler struggle with?
+### What to take away
 
-**PPL Metropolis**
-- Proposes each parameter *independently* with a fixed Gaussian, so correlated
-  parameters (e.g. μ and T₀ both affect melt) cause the acceptance rate to drop
-  unless `proposal_std` is tuned carefully.
-- Each evaluation calls the forward Euler ODE in Python — slow enough that
-  5000 samples takes several seconds.  HMC would need numerical gradients with
-  `2·n_params` ODE calls per leapfrog step, making it even slower here.
-- The chain can get stuck near τ ≈ 0 or σ ≈ 0 without constrained proposals.
+**The tradeoff at the heart of this case study:**
 
-**PyMC NUTS**
-- The pytensor computation graph allows exact gradient computation via autodiff —
-  each NUTS step costs one gradient call (not 2·n_params × n_leapfrog evaluations).
-- NUTS self-tunes the step size and number of leapfrog steps during warmup, so
-  no manual tuning of ε or L is needed.
-- The No-U-Turn stopping criterion prevents energy-wasting U-turns, giving
-  nearly uncorrelated draws — low ACF lag-1, small ESS/draw ratio.
-- Practical result: 2 × 1000 NUTS draws typically outperform 5000 Metropolis
-  samples in effective sample size for this model.
+| | PPL Metropolis | PyMC NUTS |
+|---|---|---|
+| **Model** | Hard threshold — exact biology | Soft sigmoid — approximate |
+| **Gradients** | Not needed | Required |
+| **Handles T_base / H★ correlation** | Poorly — proposes them independently | Well — gradient encodes the trade-off |
+| **Tuning effort** | Must set per-parameter σ by hand | Self-tunes during warmup |
+| **Chain length needed** | Long (high autocorrelation near correlated ridge) | Short (near-independent draws) |
 
-**When would you choose the PPL over PyMC?**
-For teaching, rapid prototyping, or highly custom models that don't fit any
-standard distribution family.  PyMC wins when you need production-quality
-inference on a well-structured model.
+**Why Metropolis struggles here.**
+$T_{\\text{base}}$ and $H^\\star$ sit on a narrow curved ridge in parameter
+space (the negative correlation you saw in the pair plot). Metropolis
+proposes each parameter independently with a fixed Gaussian, so most
+proposals land off the ridge and are rejected. The sampler creeps slowly
+along it, producing highly autocorrelated chains.
+
+**Why NUTS handles it better.**
+The gradient of the log-posterior points *along* the ridge, so NUTS
+proposals follow the ridge naturally, exploring it efficiently without
+manual tuning.
+
+**The cost: soft vs. hard threshold.**
+NUTS required replacing the biologically exact hard threshold with a
+smooth sigmoid approximation. For this problem the approximation is
+excellent, but in general you must decide whether the model fidelity
+lost is acceptable — or invest in a bespoke gradient computation.
 """)
+
         else:
-            st.info("Run both **Section 3** (PPL) and **Section 4** (PyMC) first to see the comparison.")
+            st.info("Run both **Section 3** (PPL) and **Section 4** (PyMC) first "
+                    "to see the comparison.")
+

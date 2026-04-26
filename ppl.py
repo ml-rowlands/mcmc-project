@@ -260,6 +260,15 @@ class MCMC:
     # ── Metropolis ─────────────────────────────────────────────────────────
 
     def _proposal_step(self) -> dict:
+        """
+        Propose a new state.  proposal_std may be a float (same width for
+        all parameters) or a dict {var_name: float} for per-parameter widths.
+        """
+        if isinstance(self.proposal_std, dict):
+            return {k: float(np.random.normal(
+                        self.current_state[k],
+                        self.proposal_std.get(k, 0.1)))
+                    for k in self.model.free_vars}
         return {k: float(np.random.normal(self.current_state[k], self.proposal_std))
                 for k in self.model.free_vars}
 
@@ -393,3 +402,92 @@ class NormalVecLikelihood:
         if mu is None or sigma is None or np.any(np.asarray(sigma) <= 0):
             return -np.inf
         return float(np.sum(sp.norm.logpdf(self.y, mu, sigma)))
+
+
+# ── DirectMCMC ─────────────────────────────────────────────────────────────────
+
+class DirectMCMC:
+    """
+    Metropolis sampler for a user-supplied log_prob function.
+
+    Use this when you don't want to build a Model graph — just supply a
+    callable that takes a state dict and returns a float (log prior + log
+    likelihood combined).  Supports per-parameter proposal widths via a dict.
+
+    Parameters
+    ----------
+    log_prob_fn   : callable  state dict → float
+    initial_state : dict of starting values
+    proposal_std  : float or dict {var_name: float}
+                    A dict lets you tune each parameter independently —
+                    important when parameters have very different scales.
+
+    Example
+    -------
+    >>> sampler = DirectMCMC(
+    ...     log_prob_fn = my_log_prob,
+    ...     initial_state = {"mu": 0.0, "sigma": 1.0},
+    ...     proposal_std  = {"mu": 0.3, "sigma": 0.1},
+    ... )
+    >>> chain = sampler.sample(n_samples=2000, burn_in=500)
+    """
+
+    def __init__(self, log_prob_fn, initial_state: dict,
+                 proposal_std=0.1):
+        self.log_prob_fn  = log_prob_fn
+        self._init_state  = dict(initial_state)
+        self.proposal_std = proposal_std   # float or dict {var_name: float}
+
+    # ── internal state (reset each call) ──────────────────────────────────
+
+    def _reset(self):
+        self.current_state = dict(self._init_state)
+        self.chain:  list[dict] = []
+        self.accepted = 0
+        self.proposed = 0
+
+    @property
+    def acceptance_rate(self) -> float:
+        return self.accepted / self.proposed if self.proposed > 0 else 0.0
+
+    # ── proposal ──────────────────────────────────────────────────────────
+
+    def _proposal_step(self) -> dict:
+        if isinstance(self.proposal_std, dict):
+            return {k: float(np.random.normal(
+                        self.current_state[k],
+                        self.proposal_std.get(k, 0.1)))
+                    for k in self.current_state}
+        return {k: float(np.random.normal(self.current_state[k], self.proposal_std))
+                for k in self.current_state}
+
+    # ── Metropolis ────────────────────────────────────────────────────────
+
+    def _metropolis(self, n_samples: int, burn_in: int):
+        for i in range(n_samples + burn_in):
+            proposed = self._proposal_step()
+            lp_curr  = self.log_prob_fn(self.current_state)
+            lp_prop  = self.log_prob_fn(proposed)
+
+            if np.log(np.random.rand() + 1e-300) < (lp_prop - lp_curr):
+                self.current_state = proposed
+                if i >= burn_in:
+                    self.accepted += 1
+
+            self.proposed += 1
+            if i >= burn_in:
+                self.chain.append(self.current_state.copy())
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def sample(self, n_samples: int = 1000, burn_in: int = 500) -> list:
+        """
+        Draw Metropolis samples.  Resets chain/counters on every call.
+
+        Returns
+        -------
+        list of dicts, each mapping parameter names → sampled values
+        """
+        self._reset()
+        self._metropolis(n_samples, burn_in)
+        return self.chain
