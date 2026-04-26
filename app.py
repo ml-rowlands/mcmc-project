@@ -2164,6 +2164,9 @@ handles the correlated parameter posterior.
     T_daily_ph, doy_obs_ph, years_ph, true_params_ph = generate_phenology_data()
     n_years_ph = len(years_ph)
 
+    # Shared colour palette — used in both PPL and PyMC sections
+    ph_colors = [C_BLUE, C_RED, C_ORANGE, C_GREEN]
+
     # ── Section 1: Physical model ──────────────────────────────────────────────
     with st.expander("📐 Section 1 — The physical model", expanded=True):
         s1L, s1R = st.columns([1, 1])
