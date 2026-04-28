@@ -1219,6 +1219,16 @@ then compare them head-to-head in the **Comparison** tab.
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_mh:
     st.header("Metropolis-Hastings")
+    st.markdown("""
+**From the Overview to here.** The Overview showed *what* a posterior gives us:
+a distribution over (β₀, β₁), an ensemble of regression lines, honest uncertainty.
+This tab and the next show *how* to actually obtain such a posterior.
+
+We're going to build the algorithm in **1-D** so you can see every step on a plot.
+The math and code are identical in 2D, 100D, or 10 000-D — the parameter vector
+just gets longer. To stay general we'll write **π(q)** for the target distribution
+(think: posterior) and **q** for the parameter being sampled (think: β).
+""")
 
     # Target selector persists across all steps
     tc, dc = st.columns([2, 4])
@@ -1271,7 +1281,10 @@ The strategy: construct a **Markov chain** that wanders through q-space and, in 
             st.markdown("""
 σ is the **proposal width** (step size). It controls how far we jump on average.
 
-The proposal is **symmetric** — proposing q\* from q is just as likely as proposing q from q\*. This symmetry cancels the Hastings correction, leaving only the target ratio in the acceptance step.
+The proposal is **symmetric** — the chance of proposing q\* from q equals the
+chance of proposing q from q\*. (This matters in the next step: the symmetry
+makes the accept/reject rule depend *only* on the ratio of target densities,
+which is what lets the unknown normalising constant Z cancel.)
 """)
             st.markdown("---")
             demo_sig = st.slider("Try different σ values", 0.1, 4.0, 1.0, 0.1,
@@ -1319,7 +1332,11 @@ The proposal is **symmetric** — proposing q\* from q is just as likely as prop
         L, R = st.columns([1, 2])
         with L:
             st.markdown("## Accept or reject?")
-            st.markdown("Compute the **log acceptance ratio**:")
+            st.markdown(r"""
+The accept probability is $\alpha = \min\bigl(1,\, \pi(q^*)/\pi(q)\bigr)$.
+In code we work in **log space** — products of small probabilities underflow
+to zero in floating point, but their logs are well-behaved. So we compute:
+""")
             st.latex(r"\log\alpha = \log\pi(q^*) - \log\pi(q)")
             st.markdown("Draw u ~ Uniform(0,1). Accept if log u < log α.")
             st.markdown("""
@@ -1453,6 +1470,19 @@ Repeat propose → accept/reject over and over. The chain **wanders** through q-
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_hmc:
     st.header("Hamiltonian Monte Carlo & the Leapfrog Integrator")
+    st.markdown("""
+**Why a second algorithm?** Metropolis works, but it's a *random walk* — every
+proposal is a blind Gaussian step. In high dimensions that's painfully slow:
+to travel a distance of 100 units requires roughly 100² = 10 000 steps.
+
+**The HMC trick.** Most Bayesian models give us not just the log-posterior
+log π(q) but its **gradient** ∇ log π(q) — automatic differentiation makes
+that essentially free in modern frameworks (PyTorch, JAX, PyMC, Stan).
+HMC borrows a 200-year-old idea from physics — Hamiltonian dynamics — to
+turn that gradient into long, directed proposals that *don't* random-walk.
+
+The next steps build the algorithm from scratch, with no physics prerequisite.
+""")
 
     hc, dc = st.columns([2, 4])
     with hc:
@@ -1554,20 +1584,31 @@ HMC uses this physical intuition directly: it gives the ball **momentum** and le
         L, R = st.columns([1, 2])
         with L:
             st.markdown("## Hamiltonian dynamics")
-            st.markdown("Add an auxiliary **momentum** p ~ N(0,1) to form the Hamiltonian:")
-            st.latex(r"H(q,p) = \underbrace{-\log\pi(q)}_{U(q)} + \underbrace{\frac{p^2}{2}}_{K(p)}")
             st.markdown("""
-The joint distribution of (q, p) is:
+We give the ball at position **q** an extra variable: a **velocity** p
+(physics calls it momentum). p is just a fresh Gaussian draw, p ~ N(0, 1) —
+think of it as a randomised "kick" we give the ball at the start of each
+proposal. We track the **total energy** of the (position, velocity) system:
 """)
-            st.latex(r"\pi(q,p) \propto e^{-H(q,p)}")
-            st.markdown("""
-Marginalising over p recovers our original target π(q).
+            st.latex(r"H(q,p) = \underbrace{-\log\pi(q)}_{U(q)\ \text{potential}} \;+\; \underbrace{\tfrac{1}{2}p^2}_{K(p)\ \text{kinetic}}")
+            st.markdown(r"""
+**Two facts make this work:**
 
-The **equations of motion** on constant-H surfaces are:
+1. **Total energy is conserved.** As the ball rolls, kinetic and potential
+   energy trade off but H stays constant. So the trajectory traces out a
+   *level set* of H — the curves shown on the right.
+2. **The joint distribution $\pi(q, p) \propto e^{-H(q,p)}$ has our target
+   $\pi(q)$ as its q-marginal.** Sample (q, p) jointly, then ignore p, and
+   you've sampled q from π(q). That's the whole game.
+
+Mechanically, the ball obeys two simple rules — read them as
+"velocity moves position; gradient pushes velocity":
 """)
             st.latex(r"\frac{dq}{dt} = p \qquad \frac{dp}{dt} = \nabla\!\log\pi(q)")
             st.markdown("""
-The gradient ∇log π acts as a *restoring force*, pushing the ball toward high-density regions. Trajectories on constant-H surfaces explore the target **without random-walk diffusion**.
+The gradient ∇log π acts as a *restoring force* pulling the ball toward
+high-density regions. Following these dynamics for a while gives a proposal
+that lands *far* from the start without random-walk diffusion.
 """)
         with R:
             qs_ph = np.linspace(*xr_hmc, 120)
@@ -1596,7 +1637,14 @@ The gradient ∇log π acts as a *restoring force*, pushing the ball toward high
         with L:
             st.markdown("## The leapfrog integrator")
             st.markdown("""
-To simulate Hamilton's equations we use the **leapfrog** (velocity Verlet) scheme — the same symplectic integrator from numerical ODEs:
+We can't follow the dynamics exactly — we have to discretise time into
+steps of size ε and update q and p numerically. The naive choice (Euler's method,
+update everything at once) is *bad* for this problem because it slowly leaks
+energy, drifting the ball off the level set.
+
+The **leapfrog** scheme staggers the q and p updates so that errors cancel
+out instead of accumulating. It's a 3-line update — half-step the velocity,
+full-step the position, half-step the velocity again:
 """)
             st.latex(r"""
 \begin{aligned}
@@ -1624,24 +1672,31 @@ p'      &\leftarrow p_{1/2} + \tfrac{\varepsilon}{2}\nabla\!\log\pi(q')
         with L:
             st.markdown("## Why leapfrog? Euler vs. leapfrog")
             st.markdown("""
-Forward Euler applied to Hamilton's equations:
+Forward Euler applied to the dynamics is the most obvious thing you'd write —
+update q and p simultaneously each step:
 ```
 q' = q + ε·p
 p' = p + ε·∇log π(q)
 ```
-is **not symplectic** — it injects energy into the system on every step.
+It works, sort of. But it **leaks energy** on every step. Even if the true
+dynamics conserve H exactly, Euler drifts: H grows without bound as you
+integrate longer.
 
-The leapfrog is **symplectic**: it exactly conserves a *modified* Hamiltonian H̃ = H + O(ε²), keeping the energy error **bounded for all time**.
+Leapfrog's staggered update has a magical property: it *exactly* conserves
+a slightly perturbed energy H̃ = H + O(ε²). The numerical error never
+accumulates — it just oscillates inside an ε²-sized envelope, forever.
 
 | | Energy error | Long-time behavior |
 |---|---|---|
 | Euler | O(ε) per step | Grows without bound |
-| Leapfrog | O(ε²) per step | Stays bounded |
+| Leapfrog | O(ε²) per step | **Stays bounded** |
 
-In HMC: Euler's energy drift → ΔH is large → proposals rejected → poor mixing.
-Leapfrog's near-conservation → ΔH ≈ 0 → nearly 100% acceptance.
+**Why this matters for HMC.** The accept/reject step is α = exp(−ΔH).
+Euler's drifting H → big ΔH → most proposals rejected → chain stalls.
+Leapfrog's bounded H → ΔH ≈ 0 → near-100% acceptance, and we keep the
+benefits of the long, gradient-guided trajectory.
 """)
-            st.info("This is why HMC uses leapfrog and not a standard ODE solver.")
+            st.info("This is why every production HMC implementation (Stan, PyMC, NumPyro) uses leapfrog and not a generic ODE solver.")
         with R:
             lv2_q0  = st.slider("Start q₀", float(xr_hmc[0])*0.6, float(xr_hmc[1])*0.6,
                                 1.5, 0.1, key="lv2_q0")
@@ -1734,8 +1789,25 @@ Watch the red star jump across the density with each new sample.
 with tab_cmp:
     st.header("Metropolis-Hastings vs. HMC — side-by-side")
     st.markdown("""
-Run both algorithms on the same target with matched sample counts.
-The **ACF overlay** at the bottom is the key diagnostic: faster decay → better mixing.
+You've now seen both algorithms. This tab runs them on the **same target**
+with the same sample budget and lets you compare the output.
+
+**What to watch.**
+
+- **Acceptance rate.** Optimal for MH is ~25–40 %; for HMC ~70–90 %.
+  Outside those bands, the sampler is wasting work.
+- **Trace plot.** Should look like fuzzy noise around the high-density region.
+  Long flat stretches mean rejected proposals; long drifts mean the chain
+  hasn't reached the posterior yet.
+- **Histogram.** Should match the green target curve closely. Mismatch =
+  the chain hasn't converged or has bad coverage of some mode.
+- **ACF (autocorrelation, the bottom plot).** This is the headline diagnostic.
+  It measures how correlated samples *k steps apart* are. Fast decay → near-
+  independent samples → high effective sample size per wallclock second.
+  Slow decay → most samples are redundant copies of each other.
+
+**The bottom line you should see:** for any non-trivial target, HMC's ACF
+collapses much faster than MH's. That's the payoff for using gradients.
     """)
 
     cc_l, cc_r = st.columns([1, 3])
@@ -1798,9 +1870,21 @@ The **ACF overlay** at the bottom is the key diagnostic: faster decay → better
 with tab_ppl:
     st.header("Build a Probabilistic Programming Language from Scratch")
     st.markdown("""
-We'll construct a minimal PPL step-by-step — distributions, variable nodes,
-a model graph, and an MCMC sampler — then run it on a realistic hierarchical model.
-All code lives in **`ppl.py`** alongside this app.
+**What is a PPL?** A **probabilistic programming language** is a small DSL
+for declaring Bayesian models. You write down the model — *"μ ~ Normal(0, 5),
+σ ~ HalfNormal(1), y ~ Normal(μ, σ)"* — and the runtime gives you posterior
+samples. Stan, PyMC, NumPyro, Pyro, Turing.jl, Edward, and many others all
+do this. From a CS angle a PPL is just three layers:
+
+1. **A type system for distributions** — objects that know how to evaluate
+   their log-density at a point.
+2. **A computation graph** — variables as nodes, parents as edges. Walking
+   the graph in topological order computes the joint log-probability.
+3. **An inference backend** — given that joint log-prob, run MCMC (or VI).
+
+That's it. The next 5 steps build all three layers in ~200 lines of Python,
+then fit a real hierarchical model with the result. All code lives in
+**`ppl.py`** alongside this app — read along.
 """)
 
     PPL_LABELS = [
@@ -2385,11 +2469,32 @@ samples = mcmc.sample('metropolis', n_samples=3000, burn_in=1000)
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_pheno:
     st.header("Case Study — Wildflower Phenology")
-    st.markdown("""
-Different wildflower species need different amounts of accumulated warmth before they bloom.
-We'll fit a **growing degree day (GDD) model** to 40 years of synthetic bloom observations,
-using **(a) our own PPL** and **(b) PyMC with NUTS**, then compare how well each sampler
-handles the correlated parameter posterior.
+    st.markdown(r"""
+**Why this case study?** Everything so far has been on toy 1-D targets.
+Real Bayesian work involves a forward model — a chunk of code that turns
+parameters into predicted observations — and the *likelihood* is "how well do
+those predictions match the data?" This tab walks through one real example
+end-to-end.
+
+**The science in one paragraph.** Wildflowers don't bloom on a fixed calendar
+date — they bloom once they've absorbed enough cumulative warmth. Ecologists
+model this with **growing degree days (GDD)**: each day above a threshold
+temperature $T_{\text{base}}$ contributes $T(t) - T_{\text{base}}$ heat units.
+The plant blooms on the first day total accumulated heat crosses a species-
+specific threshold $H^\star$. Given 40 years of (daily temperature, observed
+first-bloom day) data, we want to infer the unknown parameters — and we want
+honest uncertainty, because climate-change projections care about *how
+confident* the predicted bloom shift is, not just the point estimate.
+
+**What you'll see.** We fit the same model two ways:
+
+1. **Our hand-rolled PPL** (Metropolis), to prove the toy code works on a
+   realistic problem.
+2. **PyMC with NUTS** (a smart variant of HMC), to see how a production tool
+   handles a correlated, ODE-defined posterior — and to introduce the
+   *soft-threshold trick* that makes a non-differentiable model gradient-friendly.
+
+Then we compare them head-to-head.
 """)
 
     # ── Load data once ─────────────────────────────────────────────────────────
