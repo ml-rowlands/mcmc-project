@@ -659,299 +659,340 @@ with tab_ov:
     st.title("Markov Chain Monte Carlo — Interactive Explorer")
 
     OV_LABELS = [
-        "Point estimates lie",
-        "Bayesian updating",
-        "The case for Bayes",
+        "Three ways to learn from data",
+        "Bayes' theorem, gently",
+        "Why be Bayesian?",
         "The intractability wall",
         "MCMC to the rescue",
     ]
     ov_step = step_nav("ov_step", OV_LABELS)
 
-    # ── Step 0: Point estimates lie ────────────────────────────────────────────
+    # ── Step 0: Three ways to learn from data ──────────────────────────────────
     if ov_step == 0:
-        st.markdown("## Your model doesn't know what it doesn't know")
+        st.markdown("## Three ways to learn from data")
+        st.markdown(r"""
+You have some **data** and a **model** with unknown parameters.
+**Running example for the entire Overview:** simple linear regression.
+We observe $N$ pairs $(x_i, y_i)$ and assume
+
+$$y_i = \beta_0 + \beta_1\, x_i + \varepsilon_i, \qquad \varepsilon_i \sim \mathcal{N}(0,\sigma).$$
+
+The unknowns are the intercept $\beta_0$, the slope $\beta_1$, and the noise scale $\sigma$.
+The job of *statistical inference* is to use the data to say something about them.
+Three communities answer that question very differently.
+""")
         col_l, col_r = st.columns([1, 1])
 
         with col_l:
             st.markdown("""
-You train a classifier. It hits **94 % accuracy** on the test set. You ship it.
+### 1 · Frequentist statistics
+*"The parameters (β₀, β₁) are fixed, unknown numbers. Probability describes
+long-run frequencies of repeated experiments."*
 
-Six months later it confidently mislabels a critical input and nobody knows why —
-the model said **99.9 % confident**.
+- Reports a **point estimate** β̂₁ plus a **confidence interval**.
+- A 95 % CI does **not** mean "β₁ is in [a,b] with probability 95 %."
+  It means: if you repeated the whole data-collection experiment forever,
+  95 % of such intervals would cover the true β₁. Most people get this
+  wrong — including most users of it.
+- Uncertainty exists, but is awkward to talk about and hard to propagate.
 
-**The root problem: a single number cannot represent uncertainty.**
-
-Standard ML training finds one answer — the *maximum likelihood estimate*:
+### 2 · Traditional ML  (MLE / MAP / "train a model")
+*"Pick the single (β₀, β₁) that fits the data best."*
 """)
-            st.latex(r"\hat{\theta} = \arg\max_\theta \;\log p(y \mid \theta)")
+            st.latex(r"(\hat{\beta}_0, \hat{\beta}_1) = \arg\max_{\beta_0, \beta_1} \; \log p(y \mid \beta_0, \beta_1)")
             st.markdown("""
-That's a point in parameter space. It tells you which parameters fit the data *best*.
-It says nothing about how many *other* parameter settings fit almost as well.
+- For Gaussian noise this is exactly **ordinary least squares** —
+  maximise log-likelihood ⇔ minimise sum of squared errors.
+- Logistic regression, neural networks, gradient boosting — same idea,
+  return **one** parameter vector and stop.
+- Test-set error tells you average performance, but the model has no notion of
+  *"how sure am I about this prediction?"* beyond a single number.
+- Works great with lots of data. Falls apart when data is scarce or decisions are costly.
 
-**Bayesian inference** asks a different question:
-
-> Given the data I observed, what is the full *distribution* of plausible parameters?
-
-The answer is the **posterior** — a probability distribution over θ that is *wide*
-when data are scarce and *narrow* when data are abundant.
+### 3 · Bayesian inference
+*"(β₀, β₁) are themselves uncertain. Represent that uncertainty with a
+probability distribution and update it as data arrive."*
 """)
-            st.info("""
-**The Bayesian promise**
+            st.latex(r"p(\beta_0, \beta_1 \mid y) \;\propto\; p(y \mid \beta_0, \beta_1)\, p(\beta_0, \beta_1)")
+            st.markdown("""
+- Output is a **full distribution** p(β₀, β₁ | y) — the *posterior* — not a single number.
+- Wide when data is scarce, narrow when data is abundant.
+  *The model knows what it doesn't know.*
+- Translates into an **ensemble of regression lines**, weighted by how plausible each is.
+- Probability statements mean what you'd naively expect:
+  "given my data, there's a 95 % chance β₁ ∈ [a, b]."
 
-| Situation | Point estimate says | Posterior says |
-|---|---|---|
-| 3 training examples | θ̂ = 0.71 (confident) | Very uncertain — posterior is wide |
-| 3 000 training examples | θ̂ = 0.71 (confident) | Confident — posterior is narrow |
-
-The uncertainty is *quantified*, not discarded.
+**This talk is about MCMC — the algorithm that makes option 3 actually work in practice.**
 """)
 
         with col_r:
-            st.markdown("### Watch uncertainty shrink as data arrive")
-            n_flips_0 = st.slider("Number of coin flips observed (N)",
-                                  0, 120, 6, key="ov_nflips")
+            st.markdown("### The same regression, through three lenses")
+            st.markdown(r"""
+True line: $y = 1.5 + 0.8\,x + \varepsilon$, $\varepsilon \sim \mathcal{N}(0, 1)$.
+Slide N from very few points to many and watch how each viewpoint reacts.
+""")
+            n_pts_0 = st.slider("Number of data points (N)",
+                                3, 100, 6, key="ov_npts_lr")
+
             np.random.seed(42)
-            _coin_data = (np.random.rand(120) < 0.65).astype(int)
-            n_heads_0  = int(_coin_data[:n_flips_0].sum())
-            n_tails_0  = n_flips_0 - n_heads_0
+            x_full_ov = np.random.uniform(0, 5, 100)
+            y_full_ov = 1.5 + 0.8 * x_full_ov + np.random.normal(0, 1.0, 100)
+            sigma_known = 1.0
+            tau_prior   = 5.0  # weak prior on (β₀, β₁)
 
-            theta_r = np.linspace(0.001, 0.999, 400)
-            # Prior: Beta(2,2) — mild preference for a fair coin
-            prior_y   = stats.beta.pdf(theta_r, 2, 2)
-            post_y    = stats.beta.pdf(theta_r, 2 + n_heads_0, 2 + n_tails_0)
+            x_obs0 = x_full_ov[:n_pts_0]
+            y_obs0 = y_full_ov[:n_pts_0]
+            X0 = np.column_stack([np.ones_like(x_obs0), x_obs0])
 
-            fig_beta = go.Figure()
-            fig_beta.add_trace(go.Scatter(
-                x=theta_r, y=prior_y, mode="lines",
-                line=dict(color=C_ORANGE, width=2, dash="dash"),
-                name="Prior  Beta(2, 2)",
-                fill="tozeroy", fillcolor="rgba(255,161,90,0.10)",
-            ))
-            fig_beta.add_trace(go.Scatter(
-                x=theta_r, y=post_y, mode="lines",
-                line=dict(color=C_BLUE, width=3),
-                name=f"Posterior  Beta({2+n_heads_0}, {2+n_tails_0})",
-                fill="tozeroy", fillcolor="rgba(99,110,250,0.15)",
-            ))
-            fig_beta.add_vline(x=0.65, line_color=C_RED, line_dash="dot", line_width=2,
-                               annotation_text="true p = 0.65",
-                               annotation_position="top right")
-            if n_flips_0 > 0:
-                mle_p0 = n_heads_0 / n_flips_0
-                fig_beta.add_vline(x=mle_p0, line_color=C_GREEN, line_dash="dot",
-                                   line_width=2,
-                                   annotation_text=f"MLE = {mle_p0:.2f}",
-                                   annotation_position="top left")
+            # Conjugate Gaussian posterior over (β₀, β₁) with known σ
+            Sigma_n0 = np.linalg.inv(
+                X0.T @ X0 / sigma_known**2 + np.eye(2) / tau_prior**2)
+            mu_n0 = Sigma_n0 @ (X0.T @ y_obs0) / sigma_known**2
 
-            ci_lo0, ci_hi0 = stats.beta.ppf(
-                [0.025, 0.975], 2 + n_heads_0, 2 + n_tails_0)
-            post_mean0 = (2 + n_heads_0) / (4 + n_flips_0)
+            # OLS / MLE
+            beta_mle0, *_ = np.linalg.lstsq(X0, y_obs0, rcond=None)
 
-            fig_beta.update_layout(
-                title=f"N = {n_flips_0}  ({n_heads_0} heads, {n_tails_0} tails)",
-                xaxis_title="θ  =  P(heads)",
-                yaxis_title="Probability density",
-                height=310, margin=dict(t=50, b=30),
-                legend=dict(x=0.02, y=0.95),
-            )
-            st.plotly_chart(fig_beta, use_container_width=True)
+            rng_lr0 = np.random.default_rng(7)
+            post_lines0 = rng_lr0.multivariate_normal(mu_n0, Sigma_n0, 60)
+
+            x_grid_lr = np.linspace(-0.3, 5.5, 80)
+            fig_lr0 = go.Figure()
+            for s in post_lines0:
+                fig_lr0.add_trace(go.Scatter(
+                    x=x_grid_lr, y=s[0] + s[1] * x_grid_lr,
+                    mode="lines",
+                    line=dict(color="rgba(99,110,250,0.10)", width=1.2),
+                    showlegend=False, hoverinfo="skip"))
+            fig_lr0.add_trace(go.Scatter(
+                x=x_grid_lr, y=beta_mle0[0] + beta_mle0[1] * x_grid_lr,
+                mode="lines", line=dict(color=C_GREEN, width=3, dash="dash"),
+                name="MLE / OLS line"))
+            fig_lr0.add_trace(go.Scatter(
+                x=x_grid_lr, y=1.5 + 0.8 * x_grid_lr,
+                mode="lines", line=dict(color=C_RED, width=2, dash="dot"),
+                name="True line"))
+            fig_lr0.add_trace(go.Scatter(
+                x=x_obs0, y=y_obs0, mode="markers",
+                marker=dict(size=10, color="black"),
+                name=f"Data (N = {n_pts_0})"))
+            fig_lr0.add_trace(go.Scatter(
+                x=[None], y=[None], mode="lines",
+                line=dict(color="rgba(99,110,250,0.5)", width=2),
+                name="Posterior samples"))
+            fig_lr0.update_layout(
+                title=f"N = {n_pts_0}",
+                xaxis_title="x", yaxis_title="y",
+                height=320, margin=dict(t=50, b=30),
+                legend=dict(x=0.02, y=0.98))
+            st.plotly_chart(fig_lr0, use_container_width=True)
+
+            slope_mu0 = mu_n0[1]
+            slope_sd0 = float(np.sqrt(Sigma_n0[1, 1]))
+            ci_lo0 = slope_mu0 - 1.96 * slope_sd0
+            ci_hi0 = slope_mu0 + 1.96 * slope_sd0
 
             st.markdown(f"""
-**Posterior summary**
-Posterior mean: **{post_mean0:.3f}** &nbsp;·&nbsp;
-95 % credible interval: **[{ci_lo0:.3f}, {ci_hi0:.3f}]**
+**What each viewpoint reports about the slope β₁ at N = {n_pts_0}:**
 
-*Slide to N = 3 then N = 100.*
-At N = 3 the 95 % CI is very wide — Bayes knows it knows very little.
-At N = 100 the CI has collapsed around the truth.
-The MLE is always a single dot; it never conveys this.
+| Viewpoint | Output | Value |
+|---|---|---|
+| **ML / OLS (green dashed)** | one number β̂₁ | **{beta_mle0[1]:.3f}** |
+| **Frequentist** | β̂₁ + a 95 % CI from sampling theory | a fixed number, plus an interval *about the procedure* |
+| **Bayesian (blue cloud)** | full distribution p(β₁\\|y) | mean **{slope_mu0:.3f}**, 95 % credible interval **[{ci_lo0:.3f}, {ci_hi0:.3f}]** |
+
+*Try N = 3, then N = 100.* At N = 3 the OLS line will happily latch onto noise
+and report a slope wildly off from 0.8 — overconfidently. The Bayesian posterior
+is wide: the cloud of blue lines covers many plausible regressions. By N = 100,
+all three roughly agree — but only the Bayesian one was honest about uncertainty
+the whole way.
 """)
-            st.info("Click **Next ▶** to see exactly how the posterior is computed.")
+            st.info("Click **Next ▶** to see how that posterior is actually computed.")
 
-    # ── Step 1: Bayesian updating ──────────────────────────────────────────────
+    # ── Step 1: Bayes' theorem, gently ─────────────────────────────────────────
     elif ov_step == 1:
-        st.markdown("## Bayesian inference: belief as a first-class value")
+        st.markdown("## Bayes' theorem, gently")
 
         col_l, col_r = st.columns([1, 1])
 
         with col_l:
-            st.markdown("### Bayes' theorem")
+            st.markdown("""
+Bayes' theorem is a one-line consequence of the definition of conditional probability:
+P(A and B) = P(A | B) · P(B) = P(B | A) · P(A). Rearrange and you get:
+""")
             st.latex(r"""
-\underbrace{p(\theta \mid y)}_{\text{posterior}}
+\underbrace{p(\theta \mid y)}_{\substack{\text{posterior} \\ \text{(what we want)}}}
 = \frac{
-    \underbrace{p(y \mid \theta)}_{\text{likelihood}}
+    \underbrace{p(y \mid \theta)}_{\substack{\text{likelihood} \\ \text{(model)}}}
     \;\cdot\;
-    \underbrace{p(\theta)}_{\text{prior}}
+    \underbrace{p(\theta)}_{\substack{\text{prior} \\ \text{(belief before data)}}}
 }{
-    \underbrace{p(y)}_{Z \;=\; \text{normalising constant}}
+    \underbrace{p(y)}_{\substack{Z \\ \text{(normaliser)}}}
 }
 """)
             st.markdown("""
-| Term | What it encodes |
-|------|-----------------|
-| **Prior** p(θ) | Your belief *before* seeing any data |
-| **Likelihood** p(y \| θ) | How probable the observed data is for each θ |
-| **Posterior** p(θ \| y) | Updated belief *after* seeing the data |
-| **Evidence Z** | A constant that makes the posterior integrate to 1 |
+Read each piece in plain English:
+
+- **Prior** p(θ) — what we believed about θ *before* seeing any data.
+  *(Think: the regulariser in ridge regression, or the initial weights of a network — every ML method has one, often hidden.)*
+- **Likelihood** p(y | θ) — for a candidate θ, how probable is the data we actually observed?
+  *(This is exactly the loss function in MLE, before the negative-log.)*
+- **Posterior** p(θ | y) — updated belief *after* seeing the data. **The output.**
+- **Evidence** Z = ∫ p(y | θ) p(θ) dθ — a single number that makes the posterior integrate to 1.
 
 Because Z does not depend on θ, we almost always write:
 """)
             st.latex(r"p(\theta \mid y) \;\propto\; p(y \mid \theta) \cdot p(\theta)")
             st.markdown("""
-**Bayesian updating is sequential:**
-today's posterior becomes tomorrow's prior when new data arrive —
-no retraining from scratch, just another application of Bayes' rule.
+**Two things that fall out for free:**
 
-**Credible intervals are literal probabilities:**
-a 95 % Bayesian credible interval means there is a 95 % probability
-that θ lies inside it, *given the data you observed*.
-A 95 % frequentist confidence interval means no such thing.
+1. **Sequential updating.** Today's posterior is tomorrow's prior. Want to add a
+   new batch of data? Just multiply by its likelihood. No retraining from scratch.
+2. **Probability statements that mean what you think they mean.** A 95 % Bayesian
+   *credible* interval really does mean "given the data, P(θ ∈ [a,b]) = 0.95."
+   A frequentist *confidence* interval does **not** — it's a statement about the
+   procedure, not about θ.
 """)
 
         with col_r:
-            st.markdown("### A CS example you already know: the spam filter")
-            st.markdown(r"""
-The Naive Bayes classifier — probably the first Bayesian model you encountered —
-is just Bayes' theorem applied to text classification:
-
-$$P(\text{spam} \mid \text{email}) \;\propto\; P(\text{email} \mid \text{spam}) \cdot P(\text{spam})$$
-
-- **Prior** P(spam): base rate of spam in your inbox
-- **Likelihood** P(email \| spam): how common this word sequence is in spam
-- **Posterior** P(spam \| email): the score your filter actually thresholds on
-
-It's called *Naive* because it assumes words are conditionally independent given the
-class — a simplification that makes Z tractable by factoring into per-word terms.
-
-**Real Bayesian models drop that assumption.** When the model is a neural net,
-a logistic regression with interactions, or a hierarchical model, Z becomes
-an intractable high-dimensional integral. That is where MCMC enters.
+            st.markdown("### Bayes' theorem on our linear regression")
+            st.markdown(r"Apply Bayes' rule to $y = \beta_0 + \beta_1 x + \varepsilon$:")
+            st.latex(r"""
+p(\beta_0, \beta_1 \mid y) \;\propto\;
+\underbrace{\prod_{i=1}^N \mathcal{N}\!\bigl(y_i \mid \beta_0 + \beta_1 x_i,\,\sigma\bigr)}_{\text{likelihood}}
+\;\cdot\;
+\underbrace{p(\beta_0)\, p(\beta_1)}_{\text{prior}}
+""")
+            st.markdown("""
+- **Likelihood** — Gaussian noise around the line. Maximising it ⇔ minimising
+  sum-of-squared-errors. That's just OLS in disguise.
+- **Prior** — beliefs about (β₀, β₁) before seeing data. A Normal(0, τ²) prior
+  on β₁ is *literally* L2 regularisation / ridge regression with λ = σ²/τ².
+  Every regularised regression you've trained is a secret Bayesian model with a hidden prior.
+- **Posterior** — a 2-D distribution over (β₀, β₁). For this Gaussian model
+  it's closed-form. Tweak almost anything (Student-t errors, heteroscedasticity,
+  hierarchy across groups, non-linear features) and it's not. *Then we need MCMC.*
 
 ---
 """)
-            st.markdown("### Prior sensitivity — 10 coin flips (7 heads, 3 tails)")
-            theta_r1 = np.linspace(0.001, 0.999, 400)
-            prior_specs = [
-                ("Uninformative  Beta(1, 1)", 1,  1,  C_ORANGE),
-                ("Weak fair-coin  Beta(2, 2)", 2,  2,  C_GREEN),
-                ("Strong fair-coin  Beta(10,10)", 10, 10, C_RED),
+            st.markdown("### Prior sensitivity — same 8 points, three priors on β₁")
+
+            np.random.seed(42)
+            x_lr1 = np.random.uniform(0, 5, 8)
+            y_lr1 = 1.5 + 0.8 * x_lr1 + np.random.normal(0, 1.0, 8)
+            X1    = np.column_stack([np.ones_like(x_lr1), x_lr1])
+            sigma_known1 = 1.0
+
+            prior_specs_lr = [
+                ("Strong:        β₁ ~ N(0, 0.1²)",  0.1, C_RED),
+                ("Moderate:      β₁ ~ N(0, 1²)",    1.0, C_GREEN),
+                ("Uninformative: β₁ ~ N(0, 10²)",  10.0, C_ORANGE),
             ]
+            slope_grid = np.linspace(-0.4, 1.8, 400)
             fig_sens = go.Figure()
-            for label, a, b, col in prior_specs:
-                post1 = stats.beta.pdf(theta_r1, a + 7, b + 3)
+            for label, tau, col in prior_specs_lr:
+                Sigma_n1 = np.linalg.inv(
+                    X1.T @ X1 / sigma_known1**2
+                    + np.diag([1.0 / 100.0, 1.0 / tau**2]))
+                mu_n1    = Sigma_n1 @ (X1.T @ y_lr1) / sigma_known1**2
+                slope_pdf = stats.norm.pdf(
+                    slope_grid, mu_n1[1], float(np.sqrt(Sigma_n1[1, 1])))
                 fig_sens.add_trace(go.Scatter(
-                    x=theta_r1, y=post1, mode="lines",
+                    x=slope_grid, y=slope_pdf, mode="lines",
                     line=dict(color=col, width=2.5), name=label,
                 ))
-            fig_sens.add_vline(x=0.70, line_color="gray", line_dash="dot",
-                               annotation_text="MLE = 0.70",
-                               annotation_position="top left")
+            fig_sens.add_vline(x=0.8, line_color="gray", line_dash="dot",
+                               annotation_text="true β₁ = 0.8",
+                               annotation_position="top right")
             fig_sens.update_layout(
-                title="Same data, different priors → different posteriors",
-                xaxis_title="θ = P(heads)", yaxis_title="Density",
-                height=250, margin=dict(t=50, b=30),
+                title="Same data, different priors → different posteriors on slope",
+                xaxis_title="β₁ (slope)", yaxis_title="Density",
+                height=260, margin=dict(t=50, b=30),
                 legend=dict(x=0.01, y=0.97, font=dict(size=10)),
             )
             st.plotly_chart(fig_sens, use_container_width=True)
             st.caption(
-                "With only 10 flips a strong prior still dominates. "
-                "With 100+ flips all three posteriors converge near the truth — "
-                "data eventually overwhelms any reasonable prior."
+                "With only 8 points a strong prior pulls the slope toward zero. "
+                "With 100+ points the data dominates and all three posteriors "
+                "collapse around the truth. **Bayesian inference and "
+                "regularisation are the same idea seen from different angles.**"
             )
 
-    # ── Step 2: The case for Bayes ─────────────────────────────────────────────
+    # ── Step 2: Why be Bayesian? ───────────────────────────────────────────────
     elif ov_step == 2:
-        st.markdown("## The case for Bayesian inference")
+        st.markdown("## Why be Bayesian?")
 
         col_l, col_r = st.columns([1, 1])
 
         with col_l:
             st.markdown("""
-### What you lose with a point estimate
+A trained ML model returns one parameter vector θ̂. A Bayesian model returns a
+**distribution** p(θ | y). That extra structure buys real things:
 
-| | MLE / MAP | Full Bayesian |
+| | Traditional ML (MLE / MAP) | Bayesian |
 |---|---|---|
-| **Answer** | One parameter vector θ̂ | Distribution p(θ \| y) |
-| **Uncertainty** | ✗ Not quantified | ✓ Built in |
-| **Small data** | Overconfident, often wrong | Wide posterior = honest |
-| **Predictions** | Single curve | Ensemble of curves |
-| **Downstream decisions** | No uncertainty propagation | Uncertainty flows through |
+| **Output** | one parameter vector θ̂ | distribution p(θ \\| y) |
+| **Uncertainty** | not quantified | built in, by construction |
+| **Small-data behaviour** | overconfident; can latch onto noise | posterior just gets wider |
+| **Predictions** | one curve / one logit | ensemble of plausible curves |
+| **New data** | retrain from scratch | multiply by new likelihood |
+| **Decision-making** | point predictions | full posterior → expected utility |
 
-**The small-data problem is real:**
-with 6 data points and 2 parameters, MLE gives one confident answer.
-But many parameter combinations fit the data almost equally well —
-and that ambiguity matters for decisions.
+**The small-data problem is real and CS-relevant.**
+6 data points, 2 parameters (β₀, β₁): OLS returns one confident line. But *many*
+lines fit nearly as well — and which one you picked matters when the model has to act.
 """)
             st.info("""
-**Practical example:**
-You're building a recommendation model for a user with **4 purchase history items**.
+**A CS-flavoured example.**
+You're predicting **server response time** as a linear function of **request rate**
+from 6 noisy load-test measurements (essentially the plot on the right).
 
-- **MLE says:** "outdoor gear enthusiast, confidence 0.91"
-- **Bayes says:** "probably outdoor gear, but posterior is very wide —
-  show a hedge of diverse items until more data arrive"
+- **Plain ML / OLS:** returns one line. To answer *"what's the response time at
+  2× current load?"* it gives a single number — confidently overshooting or
+  undershooting based on whichever 6 points you happened to measure.
+- **Bayesian model:** returns a *family* of lines. The posterior predictive
+  at 2× load is a *distribution* over response times — directly usable for
+  capacity planning, SLO budgeting, or "what's my P95 prediction?"
 
-The Bayesian recommendation system *knows it doesn't know* and acts accordingly.
+Bayesian inference is not exotic — it's the principled version of things CS already does.
 """)
 
         with col_r:
             st.markdown("### Posterior vs MAP — 6 data points")
             st.markdown("""
-Below: 6 students, hours studied vs pass/fail.
-Each **blue curve** is one draw from the posterior — a plausible logistic model.
-The **red curve** is the MAP estimate (single best answer).
+6 noisy observations from y = β₀ + β₁ x + ε. Each **blue line** is one draw
+from the posterior over (β₀, β₁) — a plausible regression line. The **red line**
+is the MAP estimate (single best answer).
 
-With only 6 points, the posterior is a *family* of curves, not one line.
+With only 6 points the posterior is a *family* of lines, not one line.
 """)
-            x_tiny = np.array([1.0, 2.0, 4.0, 5.0, 7.5, 9.0])
-            y_tiny = np.array([0,   0,   0,   1,   1,   1  ])
+            np.random.seed(11)
+            x_tiny_lr = np.array([0.5, 1.2, 2.0, 3.0, 4.2, 4.8])
+            y_tiny_lr = 1.5 + 0.8 * x_tiny_lr + np.random.normal(0, 1.0, 6)
+            X_t       = np.column_stack([np.ones_like(x_tiny_lr), x_tiny_lr])
+            sigma_t   = 1.0
+            tau_t     = 3.0
+            Sigma_t   = np.linalg.inv(
+                X_t.T @ X_t / sigma_t**2 + np.eye(2) / tau_t**2)
+            mu_t      = Sigma_t @ (X_t.T @ y_tiny_lr) / sigma_t**2
 
-            def _lp_tiny(b0, b1):
-                z  = np.clip(b0 + b1 * x_tiny, -30, 30)
-                ll = float(np.sum(y_tiny * (-np.log1p(np.exp(-z)))
-                                  + (1 - y_tiny) * (-np.log1p(np.exp(z)))))
-                lp = -0.5 * (b0**2 + b1**2) / 4.0
-                return ll + lp
+            rng_t   = np.random.default_rng(33)
+            post_t  = rng_t.multivariate_normal(mu_t, Sigma_t, 80)
 
-            b0g2 = np.linspace(-6, 4, 120)
-            b1g2 = np.linspace(-0.3, 2.5, 120)
-            logp2 = np.array([[_lp_tiny(b0, b1) for b0 in b0g2]
-                               for b1 in b1g2])
-            logp2 -= logp2.max()
-            prob2  = np.exp(logp2)
-            prob2 /= prob2.sum()
-
-            rng2     = np.random.default_rng(77)
-            flat_idx = rng2.choice(prob2.size, size=80, p=prob2.ravel())
-            post_b0  = b0g2[flat_idx % len(b0g2)]
-            post_b1  = b1g2[flat_idx // len(b0g2)]
-
-            x_cv2 = np.linspace(0, 10, 200)
+            x_curve = np.linspace(-0.5, 5.8, 200)
             fig_lr2 = go.Figure()
-
-            for pb0, pb1 in zip(post_b0, post_b1):
-                pc = 1.0 / (1.0 + np.exp(-(pb0 + pb1 * x_cv2)))
+            for s in post_t:
                 fig_lr2.add_trace(go.Scatter(
-                    x=x_cv2, y=pc, mode="lines",
-                    line=dict(color="rgba(99,110,250,0.07)", width=1.5),
-                    showlegend=False,
+                    x=x_curve, y=s[0] + s[1] * x_curve, mode="lines",
+                    line=dict(color="rgba(99,110,250,0.08)", width=1.5),
+                    showlegend=False, hoverinfo="skip",
                 ))
-
-            best2   = np.unravel_index(logp2.argmax(), logp2.shape)
-            b0_map2 = b0g2[best2[1]]; b1_map2 = b1g2[best2[0]]
-            p_map2  = 1.0 / (1.0 + np.exp(-(b0_map2 + b1_map2 * x_cv2)))
             fig_lr2.add_trace(go.Scatter(
-                x=x_cv2, y=p_map2, mode="lines",
+                x=x_curve, y=mu_t[0] + mu_t[1] * x_curve, mode="lines",
                 line=dict(color=C_RED, width=3), name="MAP (single estimate)",
             ))
             fig_lr2.add_trace(go.Scatter(
-                x=x_tiny[y_tiny == 0], y=y_tiny[y_tiny == 0].astype(float),
-                mode="markers", marker=dict(size=14, color=C_RED, symbol="x"),
-                name="Fail",
-            ))
-            fig_lr2.add_trace(go.Scatter(
-                x=x_tiny[y_tiny == 1], y=y_tiny[y_tiny == 1].astype(float),
-                mode="markers", marker=dict(size=14, color=C_GREEN),
-                name="Pass",
+                x=x_tiny_lr, y=y_tiny_lr, mode="markers",
+                marker=dict(size=12, color="black"), name="Data",
             ))
             fig_lr2.add_trace(go.Scatter(
                 x=[None], y=[None], mode="lines",
@@ -959,39 +1000,46 @@ With only 6 points, the posterior is a *family* of curves, not one line.
                 name="Posterior samples",
             ))
             fig_lr2.update_layout(
-                title="Posterior samples vs MAP — 6 training points",
-                xaxis_title="Hours studied",
-                yaxis=dict(title="P(pass)", range=[-0.05, 1.05]),
+                title="Posterior samples vs MAP — 6 noisy points",
+                xaxis_title="x", yaxis_title="y",
                 height=330, margin=dict(t=50, b=30),
-                legend=dict(x=0.02, y=0.95),
+                legend=dict(x=0.02, y=0.97),
             )
             st.plotly_chart(fig_lr2, use_container_width=True)
             st.caption(
-                "MAP picks the most likely single curve and discards all ambiguity. "
-                "The posterior retains every plausible curve — weighted by how well "
-                "it fits the data and how reasonable the prior considers it."
+                "MAP picks the most likely single line and discards all ambiguity. "
+                "The posterior retains every plausible line — weighted by how well "
+                "it fits the data and how reasonable the prior considers it. "
+                "If you're forecasting y at x = 7, the *width* of the ensemble "
+                "out there is your honest predictive uncertainty."
             )
 
     # ── Step 3: The intractability wall ────────────────────────────────────────
     elif ov_step == 3:
-        st.markdown("## The intractability wall")
+        st.markdown("## So why isn't everyone Bayesian already?")
 
         col_l, col_r = st.columns([1, 1])
 
         with col_l:
             st.markdown("""
-### Why not just compute the posterior directly?
-
-The posterior requires the normalising constant Z:
+The catch lives in the denominator of Bayes' rule. To actually *write down*
+the posterior as a probability distribution, you need the normaliser Z:
 """)
             st.latex(r"p(\theta \mid y) = \frac{p(y \mid \theta)\,p(\theta)}{Z}, \qquad Z = \int p(y \mid \theta)\,p(\theta)\;d\theta")
             st.markdown("""
-For almost all real models Z has **no closed form.**
+Our running example — Gaussian linear regression with Gaussian priors — is one
+of the *rare conjugate models* where Z does have a closed form. That's why we
+could draw those clean ensembles of lines without an algorithm.
 
-The only alternative is numerical integration — but this fails catastrophically
-as the number of parameters grows.
+**Change almost anything and that closed form disappears.** Robust regression
+with Student-t errors, a logistic likelihood for classification, hierarchical
+priors across groups, non-linear features, a neural network — for any of these,
+**Z has no closed-form solution.** It's a high-dimensional integral.
 
-**Grid integration cost: G^D evaluations**
+The obvious fallback is to compute it numerically: lay down a grid in
+parameter space and sum. This collapses immediately as D grows.
+
+**Grid integration cost: G^D evaluations** (D = number of parameters)
 """)
             grid_data = {
                 "Parameters D": [1, 2, 5, 10, 20, 50],
@@ -1001,15 +1049,21 @@ as the number of parameters grows.
             }
             st.dataframe(pd.DataFrame(grid_data), hide_index=True, use_container_width=True)
             st.error(
-                "**The grid approach is dead on arrival for any real model.** "
-                "Real Bayesian models routinely have 10–10 000 parameters."
+                "**Grid integration is dead on arrival for any real model.** "
+                "A modest Bayesian neural network has thousands of parameters; "
+                "a hierarchical regression has dozens. There aren't enough atoms "
+                "in the universe to grid-evaluate either."
             )
             st.markdown("""
-**Variational inference** (VI) is one alternative — it approximates the posterior
-with a simpler family of distributions and optimises.  Fast, but biased.
+So we need a way to **work with the posterior without ever computing Z.**
+Two main approaches in modern Bayesian computation:
 
-**MCMC** is exact in the limit and requires only *pointwise* evaluations of
-the unnormalised posterior — no Z needed at all.
+- **Variational inference (VI).** Approximate p(θ | y) with a simpler family
+  (often Gaussian) and optimise. Fast — feels like training a neural net —
+  but the answer is biased by whatever family you chose.
+- **Markov Chain Monte Carlo (MCMC).** Sample from the posterior directly,
+  using only pointwise evaluations of p(y|θ)·p(θ). **Exact in the limit**,
+  no closed form needed. ← *this talk*
 """)
 
         with col_r:
@@ -1070,11 +1124,27 @@ In the Metropolis acceptance step we take the *ratio* of posteriors:
         st.markdown("## MCMC: exploring the posterior without Z")
 
         st.markdown("""
-An MCMC algorithm constructs a Markov chain whose **stationary distribution is
-exactly the posterior** p(θ|y).  Simulate the chain long enough and the histogram
-of visited states converges to the posterior — *no Z required*.
+**Big idea.** Instead of trying to *write down* p(θ | y), draw a long sequence
+of **samples** from it. A histogram of those samples *is* the posterior, for any
+practical purpose: means, intervals, predictions, expected utilities — all become
+averages over samples.
 
-**Only requirement:** evaluate the unnormalised posterior p̃(θ|y) = p(y|θ)·p(θ) pointwise.
+**How.** Build a random walk over parameter space whose long-run visit frequency
+is exactly p(θ | y). The walk is a *Markov chain* (next state depends only on
+the current state). Run it long enough → samples from the posterior.
+
+**The magic step.** The walk only ever needs the **ratio** of posteriors at two
+points. In that ratio, the unknown Z cancels:
+""")
+        st.latex(r"""
+\frac{p(\theta^{*} \mid y)}{p(\theta \mid y)}
+= \frac{p(y\mid\theta^{*})\,p(\theta^{*})\,/\,Z}{p(y\mid\theta)\,p(\theta)\,/\,Z}
+= \frac{p(y\mid\theta^{*})\,p(\theta^{*})}{p(y\mid\theta)\,p(\theta)}
+""")
+        st.markdown("""
+That's the trick the rest of this app unpacks. We only ever need to evaluate
+the *unnormalised* posterior p̃(θ) = p(y|θ)·p(θ) — likelihood × prior —
+something we always know how to compute.
 """)
 
         col_l, col_r = st.columns([1, 1])
@@ -2575,15 +2645,18 @@ chain = sampler.sample(n_samples=6000, burn_in=2000)
             st.pyplot(fig_ph_diag)
             plt.close(fig_ph_diag)
 
-            # Posterior predictive
-            np.random.seed(0)
-            idx_pp = np.random.choice(len(ch_ph), min(300, len(ch_ph)), replace=False)
-            doy_pp = np.array([
+            # Posterior predictive — include observation noise σ so the band
+            # reflects DOY ~ Normal(μ(θ), σ), not just μ(θ).
+            rng_pp = np.random.default_rng(0)
+            idx_pp = rng_pp.choice(len(ch_ph), min(300, len(ch_ph)), replace=False)
+            doy_mu_pp = np.array([
                 integrate_gdd_fast(T_daily_ph,
                                    ch_ph[i]["T_base"], ch_ph[i]["H_star"],
                                    int(round(ch_ph[i]["t0"])))
                 for i in idx_pp
             ])
+            sigma_pp = np.array([ch_ph[i]["sigma"] for i in idx_pp])[:, None]
+            doy_pp = doy_mu_pp + rng_pp.normal(0.0, 1.0, size=doy_mu_pp.shape) * sigma_pp
             doy_lo = np.percentile(doy_pp, 5, axis=0)
             doy_hi = np.percentile(doy_pp, 95, axis=0)
             doy_md = np.percentile(doy_pp, 50, axis=0)
@@ -2755,13 +2828,17 @@ with pm.Model():
             T_base_pm_s = idata_ph2.posterior["T_base"].values.flatten()
             H_star_pm_s = idata_ph2.posterior["H_star"].values.flatten()
             t0_pm_s     = idata_ph2.posterior["t0"].values.flatten()
-            idx_rtr = np.random.choice(len(T_base_pm_s), 300, replace=False)
-            doy_rtr = np.array([
+            sigma_pm_s  = idata_ph2.posterior["sigma"].values.flatten()
+            rng_rtr = np.random.default_rng(0)
+            idx_rtr = rng_rtr.choice(len(T_base_pm_s), 300, replace=False)
+            doy_mu_rtr = np.array([
                 integrate_gdd_fast(T_daily_ph,
                                    T_base_pm_s[i], H_star_pm_s[i],
                                    int(round(t0_pm_s[i])))
                 for i in idx_rtr
             ])
+            sig_rtr = sigma_pm_s[idx_rtr][:, None]
+            doy_rtr = doy_mu_rtr + rng_rtr.normal(0.0, 1.0, size=doy_mu_rtr.shape) * sig_rtr
             rtr_lo = np.percentile(doy_rtr, 5,  axis=0)
             rtr_hi = np.percentile(doy_rtr, 95, axis=0)
             rtr_md = np.percentile(doy_rtr, 50, axis=0)
