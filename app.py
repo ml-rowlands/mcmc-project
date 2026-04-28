@@ -659,327 +659,489 @@ with tab_ov:
     st.title("Markov Chain Monte Carlo — Interactive Explorer")
 
     OV_LABELS = [
-        "The core problem",
-        "Bayesian inference",
-        "A worked example",
-        "Where it's used",
-        "The two algorithms",
+        "Point estimates lie",
+        "Bayesian updating",
+        "The case for Bayes",
+        "The intractability wall",
+        "MCMC to the rescue",
     ]
     ov_step = step_nav("ov_step", OV_LABELS)
 
-    # ── Step 0: The core problem ───────────────────────────────────────────────
+    # ── Step 0: Point estimates lie ────────────────────────────────────────────
     if ov_step == 0:
+        st.markdown("## Your model doesn't know what it doesn't know")
         col_l, col_r = st.columns([1, 1])
+
         with col_l:
-            st.markdown("## The core problem")
             st.markdown("""
-Many problems in statistics, physics, and machine learning reduce to computing **expectations** under a probability distribution π:
+You train a classifier. It hits **94 % accuracy** on the test set. You ship it.
+
+Six months later it confidently mislabels a critical input and nobody knows why —
+the model said **99.9 % confident**.
+
+**The root problem: a single number cannot represent uncertainty.**
+
+Standard ML training finds one answer — the *maximum likelihood estimate*:
 """)
-            st.latex(r"\mathbb{E}_{\theta \sim \pi}[f(\theta)] = \int f(\theta)\,\pi(\theta)\,d\theta")
+            st.latex(r"\hat{\theta} = \arg\max_\theta \;\log p(y \mid \theta)")
             st.markdown("""
-This integral rarely has a closed form. And even numerically, it becomes **exponentially harder** as the number of dimensions grows — with 50 parameters and a 10-point grid per dimension you'd need 10⁵⁰ evaluations.
+That's a point in parameter space. It tells you which parameters fit the data *best*.
+It says nothing about how many *other* parameter settings fit almost as well.
 
-**Monte Carlo** sidesteps this with samples: draw θ₁, …, θ_N ~ π and use the average:
+**Bayesian inference** asks a different question:
+
+> Given the data I observed, what is the full *distribution* of plausible parameters?
+
+The answer is the **posterior** — a probability distribution over θ that is *wide*
+when data are scarce and *narrow* when data are abundant.
 """)
-            st.latex(r"\mathbb{E}[f(\theta)] \;\approx\; \frac{1}{N}\sum_{i=1}^{N} f(\theta_i)")
-            st.markdown("""
-The error is **O(1/√N)** — independent of dimension. The catch: how do you *draw* samples from π when π is complex and high-dimensional?
-
-If you can write down π directly (e.g. a Gaussian), you can sample it analytically. But for most real models — Bayesian posteriors, Boltzmann distributions, latent variable models — you cannot. You only know π **up to a normalizing constant**:
-""")
-            st.latex(r"\pi(\theta) = \frac{\tilde\pi(\theta)}{Z}, \qquad Z = \int \tilde\pi(\theta)\,d\theta \text{ unknown}")
-            st.markdown("""
-**MCMC** is the answer: construct a Markov chain that is *easy to simulate* and whose stationary distribution is *exactly π*, without ever computing Z.
-""")
-            st.info("Click **Next ▶** to see how Bayesian inference creates this exact situation.")
-        with col_r:
-            # Illustrate the curse of dimensionality + Monte Carlo convergence
-            rng_ov = np.random.default_rng(7)
-            ns = [10, 50, 200, 1000, 5000]
-            errs = []
-            for n in ns:
-                s = rng_ov.standard_normal((200, n))
-                mc_est = np.mean(np.abs(s), axis=1)   # E[|X|] for N(0,1) = sqrt(2/pi)
-                errs.append(float(np.std(mc_est)))
-            true_val = np.sqrt(2.0 / np.pi)
-            xs_cod = np.linspace(5, 6000, 300)
-
-            fig_cod = go.Figure()
-            fig_cod.add_trace(go.Scatter(
-                x=xs_cod, y=1.0 / np.sqrt(xs_cod),
-                mode="lines", line=dict(color=C_GREEN, width=2.5, dash="dash"),
-                name="O(1/√N) theory",
-            ))
-            fig_cod.add_trace(go.Scatter(
-                x=ns, y=errs, mode="markers+lines",
-                marker=dict(size=10, color=C_BLUE),
-                line=dict(color=C_BLUE, width=2),
-                name="MC error (empirical)",
-            ))
-            fig_cod.update_layout(
-                title="Monte Carlo error decays as O(1/√N) — independent of dimension",
-                xaxis_title="Number of samples N",
-                yaxis_title="Std. error of estimate",
-                height=360, margin=dict(t=70, b=30),
-                legend=dict(x=0.45, y=0.95),
-            )
-            st.plotly_chart(fig_cod, use_container_width=True)
-
             st.info("""
-**Reading the diagnostics** (used throughout the app)
+**The Bayesian promise**
 
-| | Good sign |
-|---|---|
-| Trace | Noisy, no trend |
-| Histogram | Matches green density |
-| ACF | Decays quickly to 0 |
-| Acceptance | MH: 20–50 % · HMC: 60–90 % |
-""")
+| Situation | Point estimate says | Posterior says |
+|---|---|---|
+| 3 training examples | θ̂ = 0.71 (confident) | Very uncertain — posterior is wide |
+| 3 000 training examples | θ̂ = 0.71 (confident) | Confident — posterior is narrow |
 
-    # ── Step 1: Bayesian inference ─────────────────────────────────────────────
-    elif ov_step == 1:
-        col_l, col_m, col_r = st.columns(3)
-
-        with col_l:
-            st.markdown("#### Frequentist view")
-            st.markdown("""
-Parameters **θ** are fixed but unknown constants. Data **y** is the random quantity.
-
-Inference answers: *"If θ equalled some null value, how surprising would this data be?"*
-
-Tools: p-values, confidence intervals, maximum-likelihood estimates (MLEs).
-
-A **95% confidence interval** means: if we repeated the experiment many times, 95% of the constructed intervals would contain the true θ. It says nothing about the probability that *this particular* interval contains θ.
-""")
-
-        with col_m:
-            st.markdown("#### Bayesian view")
-            st.markdown("""
-Parameters **θ** are treated as random variables. Inference answers: *"Given the data I observed, what should I believe about θ?"*
-
-Formalised by **Bayes' theorem**:
-""")
-            st.latex(r"\underbrace{p(\theta \mid y)}_{\text{posterior}} \;\propto\; \underbrace{p(y \mid \theta)}_{\text{likelihood}} \;\cdot\; \underbrace{p(\theta)}_{\text{prior}}")
-            st.markdown("""
-A **95% credible interval** directly means: given the data, there is a 95% probability that θ lies in this interval.
-
-The full posterior is useful for predictions, decisions, and propagating uncertainty downstream.
+The uncertainty is *quantified*, not discarded.
 """)
 
         with col_r:
-            st.markdown("#### Where MCMC enters")
-            st.markdown("""
-The exact posterior requires the normalizing constant:
-""")
-            st.latex(r"p(\theta \mid y) = \frac{p(y \mid \theta)\,p(\theta)}{\underbrace{\int p(y \mid \theta)\,p(\theta)\,d\theta}_{Z \;=\; \text{intractable}}}")
-            st.markdown("""
-For most real models Z has **no closed form** — and numerical quadrature fails once the parameter space has more than ~4 dimensions.
+            st.markdown("### Watch uncertainty shrink as data arrive")
+            n_flips_0 = st.slider("Number of coin flips observed (N)",
+                                  0, 120, 6, key="ov_nflips")
+            np.random.seed(42)
+            _coin_data = (np.random.rand(120) < 0.65).astype(int)
+            n_heads_0  = int(_coin_data[:n_flips_0].sum())
+            n_tails_0  = n_flips_0 - n_heads_0
 
-**MCMC only needs the numerator** — the unnormalized product p(y|θ)·p(θ) — evaluated pointwise. The chain is designed to explore θ-space proportionally to this product, automatically giving samples from the posterior.
+            theta_r = np.linspace(0.001, 0.999, 400)
+            # Prior: Beta(2,2) — mild preference for a fair coin
+            prior_y   = stats.beta.pdf(theta_r, 2, 2)
+            post_y    = stats.beta.pdf(theta_r, 2 + n_heads_0, 2 + n_tails_0)
 
-→ Step 3 shows a concrete model where this is necessary.
-""")
-
-    # ── Step 2: Worked example — Bayesian logistic regression ─────────────────
-    elif ov_step == 2:
-        st.markdown("## A concrete example: Bayesian logistic regression")
-        st.markdown("""
-Here is the simplest model where you **provably need MCMC** (or a similar method).
-
-**Setup**: 12 students studied for between 0 and 10 hours. Did they pass?
-We model the pass probability with a logistic curve:
-""")
-        st.latex(r"P(\text{pass} \mid x, \beta_0, \beta_1) = \sigma(\beta_0 + \beta_1 x), \qquad \sigma(z) = \frac{1}{1+e^{-z}}")
-        st.markdown("""
-We put a gentle prior on the coefficients: β₀, β₁ ~ N(0, 2²).
-
-The **posterior** is:
-""")
-        st.latex(r"p(\beta_0, \beta_1 \mid \text{data}) \;\propto\; \underbrace{\prod_{i=1}^{n} \sigma(\beta_0+\beta_1 x_i)^{y_i}(1-\sigma(\beta_0+\beta_1 x_i))^{1-y_i}}_{\text{likelihood}} \cdot \underbrace{e^{-(\beta_0^2+\beta_1^2)/8}}_{\text{prior}}")
-
-        # Fixed dataset
-        x_data = np.array([0.5, 1.0, 2.0, 2.5, 3.5, 4.0, 5.0, 6.0, 7.0, 7.5, 9.0, 10.0])
-        y_data = np.array([0,   0,   0,   1,   0,   1,   1,   0,   1,   1,   1,   1  ])
-
-        def log_posterior_logreg(b0, b1):
-            z = b0 + b1 * x_data
-            z = np.clip(z, -30, 30)
-            log_lik = np.sum(y_data * (-np.log1p(np.exp(-z)))
-                             + (1 - y_data) * (-np.log1p(np.exp(z))))
-            log_prior = -0.5 * (b0**2 + b1**2) / 4.0
-            return log_lik + log_prior
-
-        b0_grid = np.linspace(-4, 4, 180)
-        b1_grid = np.linspace(-0.5, 2.5, 180)
-        B0, B1 = np.meshgrid(b0_grid, b1_grid)
-        log_post = np.array([[log_posterior_logreg(b0, b1)
-                               for b0 in b0_grid] for b1 in b1_grid])
-        log_post -= log_post.max()
-
-        col_l, col_r = st.columns([1, 1])
-        with col_l:
-            fig_data = go.Figure()
-            x_curve = np.linspace(0, 10.5, 200)
-            # MLE (rough) for the curve — use the posterior mode region
-            best_idx = np.unravel_index(log_post.argmax(), log_post.shape)
-            b0_mode = float(b0_grid[best_idx[1]])
-            b1_mode = float(b1_grid[best_idx[0]])
-            p_curve = 1.0 / (1.0 + np.exp(-(b0_mode + b1_mode * x_curve)))
-
-            fig_data.add_trace(go.Scatter(
-                x=x_data[y_data == 0], y=y_data[y_data == 0],
-                mode="markers", marker=dict(size=14, color=C_RED, symbol="circle"),
-                name="Fail (y=0)",
+            fig_beta = go.Figure()
+            fig_beta.add_trace(go.Scatter(
+                x=theta_r, y=prior_y, mode="lines",
+                line=dict(color=C_ORANGE, width=2, dash="dash"),
+                name="Prior  Beta(2, 2)",
+                fill="tozeroy", fillcolor="rgba(255,161,90,0.10)",
             ))
-            fig_data.add_trace(go.Scatter(
-                x=x_data[y_data == 1], y=y_data[y_data == 1],
-                mode="markers", marker=dict(size=14, color=C_GREEN, symbol="circle"),
-                name="Pass (y=1)",
+            fig_beta.add_trace(go.Scatter(
+                x=theta_r, y=post_y, mode="lines",
+                line=dict(color=C_BLUE, width=3),
+                name=f"Posterior  Beta({2+n_heads_0}, {2+n_tails_0})",
+                fill="tozeroy", fillcolor="rgba(99,110,250,0.15)",
             ))
-            fig_data.add_trace(go.Scatter(
-                x=x_curve, y=p_curve, mode="lines",
-                line=dict(color=C_BLUE, width=2.5),
-                name="Posterior-mode fit",
-            ))
-            fig_data.update_layout(
-                title="The data: study hours vs. pass/fail",
-                xaxis_title="Hours studied (x)",
-                yaxis=dict(title="P(pass)", range=[-0.08, 1.08],
-                           tickvals=[0, 0.5, 1], ticktext=["0 (Fail)", "0.5", "1 (Pass)"]),
-                height=340, margin=dict(t=60, b=30),
+            fig_beta.add_vline(x=0.65, line_color=C_RED, line_dash="dot", line_width=2,
+                               annotation_text="true p = 0.65",
+                               annotation_position="top right")
+            if n_flips_0 > 0:
+                mle_p0 = n_heads_0 / n_flips_0
+                fig_beta.add_vline(x=mle_p0, line_color=C_GREEN, line_dash="dot",
+                                   line_width=2,
+                                   annotation_text=f"MLE = {mle_p0:.2f}",
+                                   annotation_position="top left")
+
+            ci_lo0, ci_hi0 = stats.beta.ppf(
+                [0.025, 0.975], 2 + n_heads_0, 2 + n_tails_0)
+            post_mean0 = (2 + n_heads_0) / (4 + n_flips_0)
+
+            fig_beta.update_layout(
+                title=f"N = {n_flips_0}  ({n_heads_0} heads, {n_tails_0} tails)",
+                xaxis_title="θ  =  P(heads)",
+                yaxis_title="Probability density",
+                height=310, margin=dict(t=50, b=30),
                 legend=dict(x=0.02, y=0.95),
             )
-            st.plotly_chart(fig_data, use_container_width=True)
+            st.plotly_chart(fig_beta, use_container_width=True)
 
-            st.markdown("""
-**Why can't we just integrate?**
+            st.markdown(f"""
+**Posterior summary**
+Posterior mean: **{post_mean0:.3f}** &nbsp;·&nbsp;
+95 % credible interval: **[{ci_lo0:.3f}, {ci_hi0:.3f}]**
 
-The posterior over (β₀, β₁) involves a product of logistic functions. There is no formula for the integral — not even in 2D. The normalizing constant Z = ∫∫ p(data|β)·p(β) dβ₀ dβ₁ must be computed numerically, and in higher-dimensional models this becomes completely infeasible.
-
-MCMC draws samples from this posterior **without computing Z**.
+*Slide to N = 3 then N = 100.*
+At N = 3 the 95 % CI is very wide — Bayes knows it knows very little.
+At N = 100 the CI has collapsed around the truth.
+The MLE is always a single dot; it never conveys this.
 """)
+            st.info("Click **Next ▶** to see exactly how the posterior is computed.")
 
-        with col_r:
-            fig_post = go.Figure()
-            fig_post.add_trace(go.Contour(
-                x=b0_grid, y=b1_grid, z=np.exp(log_post),
-                colorscale="Blues",
-                contours=dict(showlabels=False),
-                colorbar=dict(title="unnorm. posterior", len=0.6),
-                name="Posterior",
-            ))
-            fig_post.update_layout(
-                title="Unnormalized posterior p(β₀, β₁ | data)",
-                xaxis_title="β₀  (intercept)",
-                yaxis_title="β₁  (slope)",
-                height=340, margin=dict(t=60, b=30),
-            )
-            st.plotly_chart(fig_post, use_container_width=True)
+    # ── Step 1: Bayesian updating ──────────────────────────────────────────────
+    elif ov_step == 1:
+        st.markdown("## Bayesian inference: belief as a first-class value")
 
-            st.markdown("""
-**What MCMC gives you**
-
-Once you have samples (β₀⁽ⁱ⁾, β₁⁽ⁱ⁾) from the posterior you can:
-
-- Compute a **credible interval** for the probability of passing at 5 hours:
-  just evaluate σ(β₀⁽ⁱ⁾ + 5β₁⁽ⁱ⁾) for each sample and report the 2.5–97.5 percentile range
-- Answer *"given this dataset, is there a >90% chance a student who studies 8 hours passes?"*
-- Propagate uncertainty into any downstream decision
-
-None of this requires knowing Z.
-""")
-
-    # ── Step 3: Where it's used ────────────────────────────────────────────────
-    elif ov_step == 3:
-        st.markdown("## Where is this actually used?")
-        ex1, ex2, ex3 = st.columns(3)
-
-        with ex1:
-            st.markdown("#### Clinical trials")
-            st.markdown("""
-A drug trial records whether each patient responded to treatment. We want to estimate the true response rate θ and quantify uncertainty.
-
-**Simple case** (single rate): prior Beta(1,1), posterior Beta(1+successes, 1+failures) — has a closed form, no MCMC needed.
-
-**Realistic case**: adjust for covariates (age, weight, dose) via logistic regression. The posterior over all regression coefficients has no closed form → MCMC.
-
-The posterior gives a **full distribution over plausible effect sizes**, not just a point estimate, which is more useful for clinical decisions.
-""")
-
-        with ex2:
-            st.markdown("#### Hierarchical models")
-            st.markdown("""
-Many datasets have **grouped structure**: students within schools, patients within hospitals. A hierarchical model pools information while estimating group-specific effects.
-""")
-            st.latex(r"""\mu_j \sim \mathcal{N}(\mu, \sigma^2_\mu), \quad
-y_{ij} \sim \mathcal{N}(\mu_j, \sigma^2_e)""")
-            st.markdown("""
-The posterior over all school means {μⱼ}, global mean μ, and variance components has no closed form — the coupling between parameters makes direct sampling impossible even with Gaussian likelihoods.
-
-This is one of the most common uses of MCMC in social science, educational research, and medicine.
-""")
-
-        with ex3:
-            st.markdown("#### Physics & statistical mechanics")
-            st.markdown("""
-Equilibrium distributions follow the **Boltzmann distribution**:
-""")
-            st.latex(r"p(\mathbf{x}) \propto \exp\!\left(-\frac{E(\mathbf{x})}{k_B T}\right)")
-            st.markdown("""
-where **x** is the system's configuration (e.g. atomic positions) and E is its energy.
-
-Computing macroscopic properties (pressure, phase transitions) requires averaging over this. With 10²³ particles direct integration is hopeless.
-
-The Metropolis algorithm was invented for exactly this (Metropolis et al., 1953). HMC grew from molecular dynamics. Both are still heavily used in computational chemistry and lattice QCD today.
-""")
-
-    # ── Step 4: The two algorithms ─────────────────────────────────────────────
-    elif ov_step == 4:
-        st.markdown("## The two algorithms in this app")
         col_l, col_r = st.columns([1, 1])
 
         with col_l:
-            st.markdown("#### Metropolis-Hastings")
-            st.markdown("""
-The simplest MCMC algorithm. From the current position q:
-
-1. **Propose** q* ~ N(q, σ²)
-2. **Accept** with probability min(1, π(q*)/π(q))
-3. Move to q* if accepted, stay at q otherwise
-
-The chain drifts toward high-density regions because uphill moves are always accepted; downhill moves are only sometimes accepted.
-
-**Drawback**: it moves by a random walk, so to travel a distance d it takes O(d²) steps. For complex posteriors this is very slow.
+            st.markdown("### Bayes' theorem")
+            st.latex(r"""
+\underbrace{p(\theta \mid y)}_{\text{posterior}}
+= \frac{
+    \underbrace{p(y \mid \theta)}_{\text{likelihood}}
+    \;\cdot\;
+    \underbrace{p(\theta)}_{\text{prior}}
+}{
+    \underbrace{p(y)}_{Z \;=\; \text{normalising constant}}
+}
 """)
-            st.info("→ Metropolis-Hastings tab walks through this step-by-step.")
+            st.markdown("""
+| Term | What it encodes |
+|------|-----------------|
+| **Prior** p(θ) | Your belief *before* seeing any data |
+| **Likelihood** p(y \| θ) | How probable the observed data is for each θ |
+| **Posterior** p(θ \| y) | Updated belief *after* seeing the data |
+| **Evidence Z** | A constant that makes the posterior integrate to 1 |
+
+Because Z does not depend on θ, we almost always write:
+""")
+            st.latex(r"p(\theta \mid y) \;\propto\; p(y \mid \theta) \cdot p(\theta)")
+            st.markdown("""
+**Bayesian updating is sequential:**
+today's posterior becomes tomorrow's prior when new data arrive —
+no retraining from scratch, just another application of Bayes' rule.
+
+**Credible intervals are literal probabilities:**
+a 95 % Bayesian credible interval means there is a 95 % probability
+that θ lies inside it, *given the data you observed*.
+A 95 % frequentist confidence interval means no such thing.
+""")
 
         with col_r:
-            st.markdown("#### Hamiltonian Monte Carlo")
-            st.markdown("""
-A smarter algorithm that uses the **gradient** of log π to make long, directed proposals:
+            st.markdown("### A CS example you already know: the spam filter")
+            st.markdown(r"""
+The Naive Bayes classifier — probably the first Bayesian model you encountered —
+is just Bayes' theorem applied to text classification:
 
-1. Draw auxiliary momentum **p ~ N(0,1)**
-2. Run L **leapfrog steps** (a symplectic ODE integrator) to propose (q*, p*)
-3. Accept with min(1, exp(−ΔH)) — usually near 100%
+$$P(\text{spam} \mid \text{email}) \;\propto\; P(\text{email} \mid \text{spam}) \cdot P(\text{spam})$$
 
-The leapfrog integrator conserves the Hamiltonian H = U(q) + K(p), so proposals travel far along the density surface without random-walk diffusion.
+- **Prior** P(spam): base rate of spam in your inbox
+- **Likelihood** P(email \| spam): how common this word sequence is in spam
+- **Posterior** P(spam \| email): the score your filter actually thresholds on
 
-**Why leapfrog?** It's *symplectic* — it keeps energy error bounded for all time. Euler's method drifts and causes proposals to be rejected.
+It's called *Naive* because it assumes words are conditionally independent given the
+class — a simplification that makes Z tractable by factoring into per-word terms.
+
+**Real Bayesian models drop that assumption.** When the model is a neural net,
+a logistic regression with interactions, or a hierarchical model, Z becomes
+an intractable high-dimensional integral. That is where MCMC enters.
+
+---
 """)
-            st.info("→ HMC & Leapfrog tab walks through this step-by-step.")
+            st.markdown("### Prior sensitivity — 10 coin flips (7 heads, 3 tails)")
+            theta_r1 = np.linspace(0.001, 0.999, 400)
+            prior_specs = [
+                ("Uninformative  Beta(1, 1)", 1,  1,  C_ORANGE),
+                ("Weak fair-coin  Beta(2, 2)", 2,  2,  C_GREEN),
+                ("Strong fair-coin  Beta(10,10)", 10, 10, C_RED),
+            ]
+            fig_sens = go.Figure()
+            for label, a, b, col in prior_specs:
+                post1 = stats.beta.pdf(theta_r1, a + 7, b + 3)
+                fig_sens.add_trace(go.Scatter(
+                    x=theta_r1, y=post1, mode="lines",
+                    line=dict(color=col, width=2.5), name=label,
+                ))
+            fig_sens.add_vline(x=0.70, line_color="gray", line_dash="dot",
+                               annotation_text="MLE = 0.70",
+                               annotation_position="top left")
+            fig_sens.update_layout(
+                title="Same data, different priors → different posteriors",
+                xaxis_title="θ = P(heads)", yaxis_title="Density",
+                height=250, margin=dict(t=50, b=30),
+                legend=dict(x=0.01, y=0.97, font=dict(size=10)),
+            )
+            st.plotly_chart(fig_sens, use_container_width=True)
+            st.caption(
+                "With only 10 flips a strong prior still dominates. "
+                "With 100+ flips all three posteriors converge near the truth — "
+                "data eventually overwhelms any reasonable prior."
+            )
+
+    # ── Step 2: The case for Bayes ─────────────────────────────────────────────
+    elif ov_step == 2:
+        st.markdown("## The case for Bayesian inference")
+
+        col_l, col_r = st.columns([1, 1])
+
+        with col_l:
+            st.markdown("""
+### What you lose with a point estimate
+
+| | MLE / MAP | Full Bayesian |
+|---|---|---|
+| **Answer** | One parameter vector θ̂ | Distribution p(θ \| y) |
+| **Uncertainty** | ✗ Not quantified | ✓ Built in |
+| **Small data** | Overconfident, often wrong | Wide posterior = honest |
+| **Predictions** | Single curve | Ensemble of curves |
+| **Downstream decisions** | No uncertainty propagation | Uncertainty flows through |
+
+**The small-data problem is real:**
+with 6 data points and 2 parameters, MLE gives one confident answer.
+But many parameter combinations fit the data almost equally well —
+and that ambiguity matters for decisions.
+""")
+            st.info("""
+**Practical example:**
+You're building a recommendation model for a user with **4 purchase history items**.
+
+- **MLE says:** "outdoor gear enthusiast, confidence 0.91"
+- **Bayes says:** "probably outdoor gear, but posterior is very wide —
+  show a hedge of diverse items until more data arrive"
+
+The Bayesian recommendation system *knows it doesn't know* and acts accordingly.
+""")
+
+        with col_r:
+            st.markdown("### Posterior vs MAP — 6 data points")
+            st.markdown("""
+Below: 6 students, hours studied vs pass/fail.
+Each **blue curve** is one draw from the posterior — a plausible logistic model.
+The **red curve** is the MAP estimate (single best answer).
+
+With only 6 points, the posterior is a *family* of curves, not one line.
+""")
+            x_tiny = np.array([1.0, 2.0, 4.0, 5.0, 7.5, 9.0])
+            y_tiny = np.array([0,   0,   0,   1,   1,   1  ])
+
+            def _lp_tiny(b0, b1):
+                z  = np.clip(b0 + b1 * x_tiny, -30, 30)
+                ll = float(np.sum(y_tiny * (-np.log1p(np.exp(-z)))
+                                  + (1 - y_tiny) * (-np.log1p(np.exp(z)))))
+                lp = -0.5 * (b0**2 + b1**2) / 4.0
+                return ll + lp
+
+            b0g2 = np.linspace(-6, 4, 120)
+            b1g2 = np.linspace(-0.3, 2.5, 120)
+            logp2 = np.array([[_lp_tiny(b0, b1) for b0 in b0g2]
+                               for b1 in b1g2])
+            logp2 -= logp2.max()
+            prob2  = np.exp(logp2)
+            prob2 /= prob2.sum()
+
+            rng2     = np.random.default_rng(77)
+            flat_idx = rng2.choice(prob2.size, size=80, p=prob2.ravel())
+            post_b0  = b0g2[flat_idx % len(b0g2)]
+            post_b1  = b1g2[flat_idx // len(b0g2)]
+
+            x_cv2 = np.linspace(0, 10, 200)
+            fig_lr2 = go.Figure()
+
+            for pb0, pb1 in zip(post_b0, post_b1):
+                pc = 1.0 / (1.0 + np.exp(-(pb0 + pb1 * x_cv2)))
+                fig_lr2.add_trace(go.Scatter(
+                    x=x_cv2, y=pc, mode="lines",
+                    line=dict(color="rgba(99,110,250,0.07)", width=1.5),
+                    showlegend=False,
+                ))
+
+            best2   = np.unravel_index(logp2.argmax(), logp2.shape)
+            b0_map2 = b0g2[best2[1]]; b1_map2 = b1g2[best2[0]]
+            p_map2  = 1.0 / (1.0 + np.exp(-(b0_map2 + b1_map2 * x_cv2)))
+            fig_lr2.add_trace(go.Scatter(
+                x=x_cv2, y=p_map2, mode="lines",
+                line=dict(color=C_RED, width=3), name="MAP (single estimate)",
+            ))
+            fig_lr2.add_trace(go.Scatter(
+                x=x_tiny[y_tiny == 0], y=y_tiny[y_tiny == 0].astype(float),
+                mode="markers", marker=dict(size=14, color=C_RED, symbol="x"),
+                name="Fail",
+            ))
+            fig_lr2.add_trace(go.Scatter(
+                x=x_tiny[y_tiny == 1], y=y_tiny[y_tiny == 1].astype(float),
+                mode="markers", marker=dict(size=14, color=C_GREEN),
+                name="Pass",
+            ))
+            fig_lr2.add_trace(go.Scatter(
+                x=[None], y=[None], mode="lines",
+                line=dict(color="rgba(99,110,250,0.5)", width=2),
+                name="Posterior samples",
+            ))
+            fig_lr2.update_layout(
+                title="Posterior samples vs MAP — 6 training points",
+                xaxis_title="Hours studied",
+                yaxis=dict(title="P(pass)", range=[-0.05, 1.05]),
+                height=330, margin=dict(t=50, b=30),
+                legend=dict(x=0.02, y=0.95),
+            )
+            st.plotly_chart(fig_lr2, use_container_width=True)
+            st.caption(
+                "MAP picks the most likely single curve and discards all ambiguity. "
+                "The posterior retains every plausible curve — weighted by how well "
+                "it fits the data and how reasonable the prior considers it."
+            )
+
+    # ── Step 3: The intractability wall ────────────────────────────────────────
+    elif ov_step == 3:
+        st.markdown("## The intractability wall")
+
+        col_l, col_r = st.columns([1, 1])
+
+        with col_l:
+            st.markdown("""
+### Why not just compute the posterior directly?
+
+The posterior requires the normalising constant Z:
+""")
+            st.latex(r"p(\theta \mid y) = \frac{p(y \mid \theta)\,p(\theta)}{Z}, \qquad Z = \int p(y \mid \theta)\,p(\theta)\;d\theta")
+            st.markdown("""
+For almost all real models Z has **no closed form.**
+
+The only alternative is numerical integration — but this fails catastrophically
+as the number of parameters grows.
+
+**Grid integration cost: G^D evaluations**
+""")
+            grid_data = {
+                "Parameters D": [1, 2, 5, 10, 20, 50],
+                "Grid pts / dim": [1000, 100, 100, 100, 10, 10],
+                "Evaluations needed": ["10³", "10⁴", "10¹⁰", "10²⁰", "10²⁰", "10⁵⁰"],
+                "Time @ 10⁹/s": ["instant", "instant", "10 s", "3×10³ yr", "3×10³ yr", "3×10³³ yr"],
+            }
+            st.dataframe(pd.DataFrame(grid_data), hide_index=True, use_container_width=True)
+            st.error(
+                "**The grid approach is dead on arrival for any real model.** "
+                "Real Bayesian models routinely have 10–10 000 parameters."
+            )
+            st.markdown("""
+**Variational inference** (VI) is one alternative — it approximates the posterior
+with a simpler family of distributions and optimises.  Fast, but biased.
+
+**MCMC** is exact in the limit and requires only *pointwise* evaluations of
+the unnormalised posterior — no Z needed at all.
+""")
+
+        with col_r:
+            st.markdown("### Curse of dimensionality — all the mass is in a shell")
+
+            from scipy.special import gamma as _gamma_fn
+            dims_cod = np.arange(1, 35)
+            # Volume of d-ball as fraction of bounding d-cube
+            ball_frac = (np.pi ** (dims_cod / 2.0)
+                         / (_gamma_fn(dims_cod / 2.0 + 1) * 2.0 ** dims_cod))
+            ball_frac = np.clip(ball_frac, 1e-300, 1.0)
+
+            fig_cod2 = go.Figure()
+            fig_cod2.add_trace(go.Scatter(
+                x=dims_cod, y=ball_frac * 100.0,
+                mode="lines+markers",
+                line=dict(color=C_RED, width=2.5),
+                marker=dict(size=5),
+                name="% of cube volume in inscribed ball",
+            ))
+            fig_cod2.update_layout(
+                title="In high dimensions, the cube is almost all corners",
+                xaxis_title="Number of dimensions D",
+                yaxis_title="% of cube volume in inscribed ball",
+                yaxis=dict(type="log"),
+                height=240, margin=dict(t=50, b=30),
+            )
+            st.plotly_chart(fig_cod2, use_container_width=True)
+
+            st.markdown("""
+In 10D, less than 0.25 % of the bounding box has any posterior mass inside it.
+A uniform grid wastes 99.75 % of its evaluations.
+The posterior mass lives on a thin **typical set** — a shell that grid methods
+cannot find efficiently but MCMC navigates naturally.
+
+---
+
+### The key insight: Z cancels in MCMC
+
+In the Metropolis acceptance step we take the *ratio* of posteriors:
+""")
+            st.latex(r"""
+\alpha
+= \min\!\left(1,\;\frac{p(\theta^* \mid y)}{p(\theta \mid y)}\right)
+= \min\!\left(1,\;
+  \frac{p(y \mid \theta^*)\,p(\theta^*)}{p(y \mid \theta)\,p(\theta)}
+  \cdot\cancel{\frac{Z}{Z}}
+\right)
+""")
+            st.success(
+                "**Z cancels exactly.**  "
+                "MCMC only needs the unnormalised product p(y|θ)·p(θ) — "
+                "evaluated at two points.  No integrals, no Z."
+            )
+
+    # ── Step 4: MCMC to the rescue ─────────────────────────────────────────────
+    elif ov_step == 4:
+        st.markdown("## MCMC: exploring the posterior without Z")
+
+        st.markdown("""
+An MCMC algorithm constructs a Markov chain whose **stationary distribution is
+exactly the posterior** p(θ|y).  Simulate the chain long enough and the histogram
+of visited states converges to the posterior — *no Z required*.
+
+**Only requirement:** evaluate the unnormalised posterior p̃(θ|y) = p(y|θ)·p(θ) pointwise.
+""")
+
+        col_l, col_r = st.columns([1, 1])
+
+        with col_l:
+            st.markdown("""#### Metropolis-Hastings (Metropolis et al., 1953)
+
+Invented for nuclear-weapons simulations at Los Alamos.
+From the current position θ:
+
+1. **Propose** θ* ~ N(θ, σ²) &nbsp; *(random Gaussian step)*
+2. Compute **acceptance ratio** α = min(1, p̃(θ*) / p̃(θ))
+3. Accept θ* with probability α; otherwise stay at θ
+
+The chain drifts toward high-probability regions because uphill moves always
+accept; downhill moves accept with a probability proportional to the density
+drop, so the chain never gets permanently trapped.
+
+**Drawback:** moves like a random walk.  To travel distance d the chain needs
+O(d²) steps — slow in high dimensions.
+""")
+            st.info("→ **Metropolis-Hastings tab** — step-by-step walkthrough with live visualisations")
+
+        with col_r:
+            st.markdown("""#### Hamiltonian Monte Carlo (Duane et al., 1987)
+
+Invented for lattice QCD simulations.  Add an auxiliary **momentum** p ~ N(0, I)
+and define the Hamiltonian:
+""")
+            st.latex(r"H(\theta, p) = \underbrace{-\log \tilde{p}(\theta \mid y)}_{U(\theta)\ \text{potential}} + \underbrace{\tfrac{1}{2}p^\top p}_{K(p)\ \text{kinetic}}")
+            st.markdown("""
+Run **leapfrog integration** (a symplectic ODE solver) for L steps at step size ε.
+The leapfrog trajectory follows constant-H surfaces, so the proposal lands *far*
+from the start without the random-walk diffusion of MH.
+
+Accept/reject on ΔH to correct for discretisation error.
+
+**Requires:** ∇_θ log p̃(θ|y) — the gradient, computed by automatic differentiation
+in PyMC / Stan / NumPyro.
+""")
+            st.info("→ **HMC & Leapfrog tab** — leapfrog integrator + phase portrait visualisations")
 
         st.divider()
+        st.markdown("### At a glance")
         st.markdown("""
-| | Metropolis-Hastings | Hamiltonian Monte Carlo |
+| | **Metropolis-Hastings** | **Hamiltonian Monte Carlo** |
 |---|---|---|
-| **Proposal** | Random Gaussian jump | Gradient-guided leap via Hamiltonian dynamics |
-| **Mixing speed** | Slow — random walk scaling O(d²) | Fast — can traverse the space in O(d) steps |
-| **What it needs** | log π(q) only | log π(q) **and** ∇log π(q) |
-| **Key tuning** | Proposal width σ | Step size ε, leapfrog steps L |
+| **Year / origin** | 1953 — nuclear physics | 1987 — lattice QCD |
+| **Proposal** | Random Gaussian jump | Gradient-guided leapfrog trajectory |
+| **Needs** | log p̃(θ) only | log p̃(θ) + **gradient** ∇ log p̃(θ) |
+| **Mixing speed** | Slow — random walk O(d²) | Fast — O(d^{5/4}) steps |
 | **Acceptance rate** | Target ~23–50 % | Target ~60–90 % |
-| **Historical origin** | Metropolis et al. (1953) for nuclear physics | Duane et al. (1987) for lattice QCD |
+| **Tuning knobs** | Proposal width σ | Step size ε, leapfrog steps L |
+| **Used in** | Teaching, non-differentiable models | PyMC, Stan, NumPyro, Pyro |
 
-Use the tabs above to step through each algorithm interactively, then compare them head-to-head in the **Comparison** tab.
+Use the tabs above to step through each algorithm interactively,
+then compare them head-to-head in the **Comparison** tab.
+""")
+        st.info("""
+**Reading MCMC diagnostics** — used throughout the rest of this app
+
+| Plot | What "good" looks like |
+|---|---|
+| **Trace plot** | Noisy, no trend, no long flat stretches |
+| **Histogram** | Smooth, matches the target density |
+| **ACF** | Drops quickly toward zero |
+| **Acceptance rate** | MH: 20–50 % · HMC: 60–90 % |
 """)
 
 # ─────────────────────────────────────────────────────────────────────────────
