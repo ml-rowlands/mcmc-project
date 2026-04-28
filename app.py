@@ -1887,11 +1887,9 @@ do this. From a CS angle a PPL is just three layers:
    (gradient-driven). The latter needs ∇ log p — and we get it for free
    from autodiff.
 
-**The headline upgrade in this version: PyTorch under the hood.** Earlier
-takes of this tab used pure NumPy/SciPy and approximated the HMC gradient
-with finite differences (slow, noisy, scales poorly with dimension).
-Modern PPLs — Stan, PyMC, NumPyro, Pyro — *all* sit on a differentiable
-tensor library. We do the same: every distribution's `log_prob` returns a
+**Under the hood: PyTorch.** Modern PPLs — Stan, PyMC, NumPyro, Pyro — all
+sit on a differentiable tensor library, so HMC's gradient is just one call
+into autodiff. We do the same: every distribution's `log_prob` returns a
 `torch.Tensor`, the joint log-prob is one differentiable graph, and HMC's
 gradient is a one-line call to `torch.autograd.grad`. All code lives in
 **`ppl_torch.py`** alongside this app — read along.
@@ -1916,10 +1914,9 @@ Every variable in a probabilistic model has a **distribution** — a
 probability density that tells us how plausible each value is. In our PPL,
 each distribution class just needs one method: `log_prob(x)`.
 
-**The crucial change vs a pure-NumPy PPL:** `log_prob(x)` returns a
-`torch.Tensor`, *not* a plain float. Tensors record their computation
-graph, so calling `torch.autograd.grad` on the joint log-prob later gives
-us exact gradients with no extra work.
+**Why tensors, not plain floats?** `log_prob(x)` returns a `torch.Tensor`,
+which records its computation graph. Calling `torch.autograd.grad` on the
+joint log-prob later gives us exact gradients with no extra work.
 
 We use **log**-probabilities throughout because they avoid underflow,
 turn products into sums, and let constants cancel in MCMC ratios.
@@ -2197,16 +2194,13 @@ def metropolis(self, n_samples, burn_in=500, proposal_std=0.1, seed=0):
         with L:
             st.markdown("## HMC, powered by autograd")
             st.markdown("""
-HMC needs `∇ log p(q)` to drive the leapfrog integrator. Older versions of
-this PPL used finite differences — fine in 1-D, but they cost `O(n)`
+HMC needs `∇ log p(q)` to drive the leapfrog integrator. The naive
+fallback — finite differences — is fine in 1-D, but it costs `O(n)`
 log-prob evaluations per gradient and the noise compounds in 50+ dimensions.
 
 With PyTorch we get the gradient in **one line**. Our distributions already
 return tensors; the joint log-prob is one differentiable graph; one call to
 `torch.autograd.grad` walks it and gives us the exact gradient.
-
-This is the headline jump: HMC's machinery is the same, but the gradient
-routine collapses from a loop to a function call.
 """)
             st.code("""\
 # Whole gradient — one differentiable pass through the model
