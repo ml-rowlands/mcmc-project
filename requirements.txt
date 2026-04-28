@@ -6,3 +6,4 @@ matplotlib>=3.7.0
 pandas>=2.0.0
 pymc>=5.0.0
 arviz>=0.16.0
+torch>=2.0
