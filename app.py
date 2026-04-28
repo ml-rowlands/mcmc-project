@@ -17,6 +17,9 @@ import pandas as pd
 import os, io, warnings
 
 import ppl as _ppl
+import ppl_torch as _pplt
+import torch
+import torch.distributions as td
 
 st.set_page_config(page_title="MCMC Explorer", page_icon="⛓", layout="wide")
 
@@ -1876,15 +1879,22 @@ for declaring Bayesian models. You write down the model — *"μ ~ Normal(0, 5),
 samples. Stan, PyMC, NumPyro, Pyro, Turing.jl, Edward, and many others all
 do this. From a CS angle a PPL is just three layers:
 
-1. **A type system for distributions** — objects that know how to evaluate
-   their log-density at a point.
-2. **A computation graph** — variables as nodes, parents as edges. Walking
-   the graph in topological order computes the joint log-probability.
-3. **An inference backend** — given that joint log-prob, run MCMC (or VI).
+1. **A type system for distributions** — objects whose `log_prob` is
+   differentiable.
+2. **A model abstraction** — a function from a parameter vector to a scalar
+   joint log-probability. Same input/output as a neural-net loss.
+3. **An inference backend** — Metropolis (gradient-free) or HMC
+   (gradient-driven). The latter needs ∇ log p — and we get it for free
+   from autodiff.
 
-That's it. The next 5 steps build all three layers in ~200 lines of Python,
-then fit a real hierarchical model with the result. All code lives in
-**`ppl.py`** alongside this app — read along.
+**The headline upgrade in this version: PyTorch under the hood.** Earlier
+takes of this tab used pure NumPy/SciPy and approximated the HMC gradient
+with finite differences (slow, noisy, scales poorly with dimension).
+Modern PPLs — Stan, PyMC, NumPyro, Pyro — *all* sit on a differentiable
+tensor library. We do the same: every distribution's `log_prob` returns a
+`torch.Tensor`, the joint log-prob is one differentiable graph, and HMC's
+gradient is a one-line call to `torch.autograd.grad`. All code lives in
+**`ppl_torch.py`** alongside this app — read along.
 """)
 
     PPL_LABELS = [
@@ -1900,79 +1910,77 @@ then fit a real hierarchical model with the result. All code lives in
     if ppl_step == 0:
         L, R = st.columns([1, 1])
         with L:
-            st.markdown("## Distributions")
+            st.markdown("## Distributions, in PyTorch")
             st.markdown("""
 Every variable in a probabilistic model has a **distribution** — a
-probability density that tells us how plausible each value is.
-In our PPL, each distribution class just needs one method: `log_prob(x)`.
+probability density that tells us how plausible each value is. In our PPL,
+each distribution class just needs one method: `log_prob(x)`.
 
-We use **log**-probabilities everywhere because:
-- They avoid numerical underflow with products of small probabilities
-- They turn products (joint distributions) into sums
-- MCMC only needs *differences* of log-probabilities, so constants cancel
+**The crucial change vs a pure-NumPy PPL:** `log_prob(x)` returns a
+`torch.Tensor`, *not* a plain float. Tensors record their computation
+graph, so calling `torch.autograd.grad` on the joint log-prob later gives
+us exact gradients with no extra work.
+
+We use **log**-probabilities throughout because they avoid underflow,
+turn products into sums, and let constants cancel in MCMC ratios.
 """)
             st.code("""\
-import scipy.stats as sp
-import numpy as np
+import torch
+import torch.distributions as td
+
+def _t(x):
+    return x if torch.is_tensor(x) else torch.as_tensor(x, dtype=torch.float64)
 
 class Normal:
-    def __init__(self, mean=0.0, std=1.0):
-        self.mean = mean   # can be a callable for linking
-        self.std  = std
-
+    def __init__(self, loc=0.0, scale=1.0):
+        self.loc, self.scale = loc, scale  # may be tensors or callables
     def log_prob(self, x):
-        mean = self.mean() if callable(self.mean) else self.mean
-        std  = self.std()  if callable(self.std)  else self.std
-        return float(sp.norm.logpdf(x, mean, std))
+        loc   = self.loc()   if callable(self.loc)   else self.loc
+        scale = self.scale() if callable(self.scale) else self.scale
+        return td.Normal(_t(loc), _t(scale)).log_prob(_t(x)).sum()
 
-class HalfNormal:          # positive-only — great prior for variances
+class LogNormal:
+    \"\"\"Convenient *unconstrained* prior for positive parameters.
+
+    Declaring sigma ~ LogNormal(0, 1) means the parameter we sample lives
+    on (-inf, inf) — perfect for HMC — while sigma > 0 is automatic.
+    \"\"\"
+    def __init__(self, loc=0.0, scale=1.0):
+        self.loc, self.scale = loc, scale
+    def log_prob(self, x):
+        return td.LogNormal(_t(self.loc), _t(self.scale)).log_prob(_t(x)).sum()
+
+class HalfNormal:
     def __init__(self, scale=1.0):
         self.scale = scale
     def log_prob(self, x):
-        if x < 0: return -np.inf
-        return float(sp.halfnorm.logpdf(x, scale=self.scale))
-
-class Gamma:               # rate parameterisation: scale = 1/beta
-    def __init__(self, alpha=1.0, beta=1.0):
-        self.alpha = alpha; self.beta = beta
-    def log_prob(self, x):
-        if x <= 0: return -np.inf
-        return float(sp.gamma.logpdf(x, a=self.alpha, scale=1/self.beta))
-
-class Beta:                # supported on (0, 1)
-    def __init__(self, alpha=1.0, beta=1.0):
-        self.alpha = alpha; self.beta = beta
-    def log_prob(self, x):
-        if x <= 0 or x >= 1: return -np.inf
-        return float(sp.beta.logpdf(x, self.alpha, self.beta))
+        return td.HalfNormal(_t(self.scale)).log_prob(_t(x)).sum()
 """, language="python")
 
         with R:
             st.markdown("### Interactive: explore the distributions")
-            dist_choice = st.selectbox("Distribution", ["Normal", "HalfNormal", "Gamma", "Beta"],
-                                       key="ppl_dist")
-            xs_d = np.linspace(-5, 5, 400)
+            dist_choice = st.selectbox(
+                "Distribution", ["Normal", "LogNormal", "HalfNormal"], key="ppl_dist")
             if dist_choice == "Normal":
-                mn = st.slider("mean", -3.0, 3.0, 0.0, 0.1, key="ppl_mn")
-                sd = st.slider("std",   0.1, 3.0, 1.0, 0.1, key="ppl_sd")
+                mn = st.slider("loc",   -3.0, 3.0, 0.0, 0.1, key="ppl_mn")
+                sd = st.slider("scale",  0.1, 3.0, 1.0, 0.1, key="ppl_sd")
                 xs_d = np.linspace(mn - 4*sd, mn + 4*sd, 400)
-                dist_obj = _ppl.Normal(mn, sd)
-            elif dist_choice == "HalfNormal":
+                dist_obj = _pplt.Normal(mn, sd)
+            elif dist_choice == "LogNormal":
+                lo = st.slider("loc (in log-space)",  -2.0, 2.0, 0.0, 0.1, key="ppl_lln_l")
+                sc = st.slider("scale (in log-space)", 0.1, 2.0, 0.5, 0.1, key="ppl_lln_s")
+                xs_d = np.linspace(0.01, np.exp(lo) * 6.0, 400)
+                dist_obj = _pplt.LogNormal(lo, sc)
+            else:  # HalfNormal
                 sc = st.slider("scale", 0.2, 3.0, 1.0, 0.1, key="ppl_sc")
-                xs_d = np.linspace(0, sc*4, 400)
-                dist_obj = _ppl.HalfNormal(sc)
-            elif dist_choice == "Gamma":
-                al = st.slider("alpha (shape)", 0.5, 8.0, 2.0, 0.5, key="ppl_al")
-                be = st.slider("beta (rate)",   0.2, 5.0, 1.0, 0.2, key="ppl_be")
-                xs_d = np.linspace(0.01, al/be + 5*np.sqrt(al)/be, 400)
-                dist_obj = _ppl.Gamma(al, be)
-            else:  # Beta
-                a2 = st.slider("alpha", 0.5, 8.0, 2.0, 0.5, key="ppl_a2")
-                b2 = st.slider("beta",  0.5, 8.0, 5.0, 0.5, key="ppl_b2")
-                xs_d = np.linspace(0.001, 0.999, 400)
-                dist_obj = _ppl.Beta(a2, b2)
+                xs_d = np.linspace(0.001, sc * 4, 400)
+                dist_obj = _pplt.HalfNormal(sc)
 
-            lps = np.array([dist_obj.log_prob(x) for x in xs_d])
+            with torch.no_grad():
+                lps = np.array([
+                    float(dist_obj.log_prob(torch.tensor(x, dtype=torch.float64)))
+                    for x in xs_d
+                ])
             pd_vals = np.exp(np.where(np.isfinite(lps), lps, -30))
 
             fig_dp = go.Figure()
@@ -1985,115 +1993,127 @@ class Beta:                # supported on (0, 1)
                                   margin=dict(t=50, b=20))
             st.plotly_chart(fig_dp, use_container_width=True)
 
-            st.markdown(f"**log_prob at x = 0.5:** `{dist_obj.log_prob(0.5):.4f}`")
-            st.info("Click **Next ▶** to see how distributions attach to variables in a model graph.")
+            # Demonstrate autograd on a single distribution
+            x_demo = torch.tensor(0.5, dtype=torch.float64, requires_grad=True)
+            lp_demo = dist_obj.log_prob(x_demo)
+            (g_demo,) = torch.autograd.grad(lp_demo, x_demo)
+            st.markdown(
+                f"**At x = 0.5:**  log_prob = `{float(lp_demo):.4f}`  ·  "
+                f"d log_prob / dx = `{float(g_demo):.4f}` *(via autograd)*"
+            )
+            st.info("Click **Next ▶** to assemble distributions into a Model.")
 
     # ── PPL Step 1: Variable nodes & Model ────────────────────────────────────
     elif ppl_step == 1:
         L, R = st.columns([1, 1])
         with L:
-            st.markdown("## Variable nodes & the Model graph")
+            st.markdown("## The Model — a flat parameter vector")
             st.markdown("""
-A **Variable** is a named node in the graph. It stores:
-- which distribution it was drawn from
-- its parent nodes (dependencies)
-- whether it's **observed** (data — fixed value) or **latent** (unknown)
+All MCMC samplers ultimately want one thing: a function from a **flat
+parameter vector** `q ∈ ℝⁿ` to a scalar `log p(q)` that records its
+computation graph (so autograd can differentiate it).
 
-A **Deterministic** node is a pure function of parents — it has no log_prob
-contribution, it just computes a derived quantity.
+Our `Model` class:
 
-The **Model** class stitches nodes together and can evaluate the
-**joint log-probability** — the sum of all node log-probs in topological order.
-This is the core quantity MCMC needs; the normalising constant never appears.
+1. Lets you declare named variables (`mu` scalar, `u` vector of length 5, …).
+2. **Packs** them in declaration order into a single 1-D tensor.
+3. **Unpacks** that tensor back into a `state` dict before scoring.
+
+Same shape as a neural-net forward pass: parameters in, scalar loss out. The
+big win: autograd flows through the unpack, through every distribution's
+`log_prob`, all the way back to `q`.
+
+For positive parameters (like `sigma > 0`) we sample on the *log*-scale and
+declare a `LogNormal` prior on the natural-scale value. The HMC chain lives
+on (-∞, ∞) — no boundary-bouncing.
 """)
             st.code("""\
-class Variable:
-    def __init__(self, name, dist, parents=None,
-                 observed=False, observed_data=None):
-        self.name          = name
-        self.dist          = dist
-        self.parents       = parents or []
-        self.observed      = observed
-        self.value         = observed_data
-        self.deterministic = isinstance(dist, Deterministic)
-
 class Model:
     def __init__(self):
-        self.variables = {}
+        self.var_names  = []   # ['mu', 'log_sigma']
+        self.var_shapes = []   # [(),  ()]
+        self._log_prob_fn = None
 
-    def add_variable(self, name, dist, parents=None,
-                     observed=False, observed_data=None):
-        var = Variable(name, dist, parents, observed, observed_data)
-        self.variables[name] = var
-        return var
+    def add_var(self, name, shape=()):
+        self.var_names.append(name)
+        self.var_shapes.append(tuple(shape))
+        return self
 
-    def add_deterministic(self, name, fn, parents):
-        var = Variable(name, Deterministic(fn), parents=parents)
-        self.variables[name] = var
-        return var
+    def set_log_prob(self, fn):
+        self._log_prob_fn = fn   # fn(state_dict) -> scalar torch tensor
 
-    def log_prob(self, state: dict) -> float:
-        logp = 0.0
-        for var in self._topological_sort():
-            if var.deterministic:
-                var.value = var.dist.evaluate()
-            else:
-                if not var.observed:
-                    var.value = state[var.name]
-                logp += var.dist.log_prob(var.value)
-        return logp
+    def unpack(self, flat):      # flat tensor -> {name: tensor}
+        out, i = {}, 0
+        for n, s in zip(self.var_names, self.var_shapes):
+            sz = int(np.prod(s)) if s else 1
+            out[n] = flat[i:i+sz].reshape(s) if s else flat[i]
+            i += sz
+        return out
+
+    def log_prob(self, flat):
+        return self._log_prob_fn(self.unpack(flat))
 """, language="python")
 
         with R:
             st.markdown("### Live demo: build and evaluate a model")
             st.markdown("""
-Let's build a simple Bayesian normal model:
+A simple Bayesian normal model with `sigma` reparameterised on the log-scale:
 ```
-mu    ~ Normal(0, 5)      # prior on the mean
-sigma ~ HalfNormal(1)     # prior on the SD (must be positive)
-y_i   ~ Normal(mu, sigma) # likelihood for each observation
+mu        ~ Normal(0, 5)
+sigma     ~ LogNormal(0, 1)         # positive by construction
+y_i       ~ Normal(mu, sigma)       # likelihood
 ```
+The free parameters are `(mu, log_sigma)` ∈ ℝ². We exponentiate inside
+`log_prob` to get `sigma`.
 """)
-            demo_mu    = st.slider("Try state: mu",    -3.0, 3.0, 1.0, 0.1, key="ppl_dmu")
-            demo_sigma = st.slider("Try state: sigma",  0.1, 3.0, 1.0, 0.1, key="ppl_dsg")
-            demo_n     = st.slider("# observations",    3, 20, 8, 1, key="ppl_dn")
+            demo_mu    = st.slider("Try state: mu",          -3.0, 3.0, 1.0, 0.1, key="ppl_dmu")
+            demo_sigma = st.slider("Try state: sigma",        0.1, 3.0, 1.0, 0.1, key="ppl_dsg")
+            demo_n     = st.slider("# observations",          3, 20, 8, 1, key="ppl_dn")
 
             np.random.seed(42)
             y_demo = np.random.normal(1.5, 0.8, demo_n)
+            y_demo_t = torch.as_tensor(y_demo, dtype=torch.float64)
 
-            m_demo   = _ppl.Model()
-            mu_d     = m_demo.add_variable("mu",    _ppl.Normal(0, 5))
-            sigma_d  = m_demo.add_variable("sigma", _ppl.HalfNormal(1))
+            def _norm_logp(state):
+                mu, log_sigma = state["mu"], state["log_sigma"]
+                sigma = torch.exp(log_sigma)
+                lp_mu  = _pplt.Normal(0.0, 5.0).log_prob(mu)
+                lp_sig = _pplt.LogNormal(0.0, 1.0).log_prob(sigma) + log_sigma  # Jacobian
+                lp_lik = _pplt.Normal(mu, sigma).log_prob(y_demo_t)
+                return lp_mu + lp_sig + lp_lik
 
-            class _NormLik:
-                def __init__(self, mu_v, sig_v, y):
-                    self.mu_v = mu_v; self.sig_v = sig_v; self.y = y
-                def log_prob(self, x):
-                    return float(np.sum(stats.norm.logpdf(self.y, self.mu_v.value, self.sig_v.value)))
+            m_demo = _pplt.Model()
+            m_demo.add_var("mu").add_var("log_sigma")
+            m_demo.set_log_prob(_norm_logp)
 
-            m_demo.add_variable("y", _NormLik(mu_d, sigma_d, y_demo),
-                                parents=[mu_d, sigma_d], observed=True, observed_data=y_demo)
+            q_demo = torch.tensor([demo_mu, float(np.log(demo_sigma))], dtype=torch.float64,
+                                  requires_grad=True)
+            lp_total = m_demo.log_prob(q_demo)
+            (g_total,) = torch.autograd.grad(lp_total, q_demo)
 
-            state_demo = {"mu": demo_mu, "sigma": demo_sigma}
-            lp_val     = m_demo.log_prob(state_demo)
-
-            logp_prior_mu    = _ppl.Normal(0, 5).log_prob(demo_mu)
-            logp_prior_sigma = _ppl.HalfNormal(1).log_prob(demo_sigma)
-            logp_lik         = float(np.sum(stats.norm.logpdf(y_demo, demo_mu, demo_sigma)))
+            with torch.no_grad():
+                st_d = m_demo.unpack(q_demo.detach())
+                lp_mu  = float(_pplt.Normal(0.0, 5.0).log_prob(st_d["mu"]))
+                sig_t  = torch.exp(st_d["log_sigma"])
+                lp_sig = float(_pplt.LogNormal(0.0, 1.0).log_prob(sig_t)
+                               + st_d["log_sigma"])
+                lp_lik = float(_pplt.Normal(st_d["mu"], sig_t).log_prob(y_demo_t))
 
             st.markdown(f"""
-**Evaluating at state** `{{mu={demo_mu:.1f}, sigma={demo_sigma:.1f}}}`
+**Evaluating at** `q = (mu={demo_mu:.2f}, log_sigma={np.log(demo_sigma):.2f})`
 
 | Component | Value |
 |---|---|
-| log p(mu) | `{logp_prior_mu:.3f}` |
-| log p(sigma) | `{logp_prior_sigma:.3f}` |
-| log p(y \| mu, sigma) | `{logp_lik:.3f}` |
-| **Joint log_prob** | **`{lp_val:.3f}`** |
-
-MCMC uses differences of joint log_prob values — the normalising constant Z cancels.
+| log p(mu) | `{lp_mu:.3f}` |
+| log p(sigma) + Jacobian | `{lp_sig:.3f}` |
+| log p(y \\| mu, sigma) | `{lp_lik:.3f}` |
+| **Joint log_prob** | **`{float(lp_total):.3f}`** |
+| **∇ log p(q)** *(via autograd)* | `[{float(g_total[0]):+.3f}, {float(g_total[1]):+.3f}]` |
 """)
-            st.info("Move the sliders: joint log_prob increases as you approach the true mean (1.5).")
+            st.info(
+                "The **gradient** above came from one `torch.autograd.grad` call — "
+                "no finite differences. HMC consumes it directly."
+            )
 
     # ── PPL Step 2: Metropolis sampler ────────────────────────────────────────
     elif ppl_step == 2:
@@ -2101,48 +2121,35 @@ MCMC uses differences of joint log_prob values — the normalising constant Z ca
         with L:
             st.markdown("## The Metropolis sampler")
             st.markdown("""
-The MCMC class wraps a Model and samples from its posterior.
-At each step it proposes a new state by perturbing every free variable
-independently with a Gaussian of width `proposal_std`, then accepts or
-rejects via the log-acceptance ratio.
+With the Model handing us a single `log_prob(q)` function, Metropolis is
+almost trivial. Propose `q* = q + ε` with `ε ~ N(0, s²I)`, accept on
+`log U < log p(q*) − log p(q)`.
+
+Notice the `torch.no_grad()` block: Metropolis doesn't need gradients, so we
+skip building the autograd graph and just evaluate the log-prob — fast.
 """)
             st.code("""\
-class MCMC:
-    def __init__(self, model, initial_state=None, proposal_std=0.1):
-        self.model        = model
-        self.proposal_std = proposal_std
-        self._init_state  = initial_state or {k: 0.0 for k in model.free_vars}
+def metropolis(self, n_samples, burn_in=500, proposal_std=0.1, seed=0):
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    q = self.init.clone()
 
-    def _reset(self):
-        self.current_state = dict(self._init_state)
-        self.chain = []; self.accepted = 0; self.proposed = 0
+    with torch.no_grad():
+        log_p = float(self.model.log_prob(q))
 
-    @property
-    def acceptance_rate(self):
-        return self.accepted / self.proposed if self.proposed > 0 else 0.0
+    chain, accepted = [], 0
+    for i in range(n_samples + burn_in):
+        q_star = q + torch.randn(q.shape, dtype=q.dtype) * proposal_std
+        with torch.no_grad():
+            log_p_star = float(self.model.log_prob(q_star))
 
-    def _proposal_step(self):
-        return {k: np.random.normal(self.current_state[k], self.proposal_std)
-                for k in self.model.free_vars}
+        if np.log(rng.random()) < (log_p_star - log_p):
+            q, log_p = q_star, log_p_star
+            if i >= burn_in: accepted += 1
+        if i >= burn_in:
+            chain.append(q.detach().numpy().copy())
 
-    def _metropolis(self, n_samples, burn_in):
-        for i in range(n_samples + burn_in):
-            proposed = self._proposal_step()
-            log_alpha = (self.model.log_prob(proposed)
-                         - self.model.log_prob(self.current_state))
-            if np.log(np.random.rand()) < log_alpha:
-                self.current_state = proposed
-                if i >= burn_in: self.accepted += 1
-            self.proposed += 1
-            if i >= burn_in: self.chain.append(self.current_state.copy())
-
-    def sample(self, method='metropolis', n_samples=1000, burn_in=500, **kw):
-        self._reset()
-        if method == 'metropolis':
-            self._metropolis(n_samples, burn_in)
-        elif method == 'hmc':
-            self._hmc(n_samples, burn_in, **kw)
-        return self.chain
+    return np.array(chain), accepted / max(n_samples, 1)
 """, language="python")
 
         with R:
@@ -2157,21 +2164,24 @@ class MCMC:
 
             if st.button("Run Metropolis", type="primary", key="ppl_run_mh"):
                 tgt_fn = TARGETS[ppl_tgt_name]["fn"]
-                class _Dist:
-                    def __init__(self, fn): self.fn = fn
-                    def log_prob(self, x): return float(self.fn(x))
-                np.random.seed(int(ppl_seed))
-                m_p  = _ppl.Model()
-                m_p.add_variable("x", _Dist(tgt_fn))
-                mcp  = _ppl.MCMC(m_p, initial_state={"x": 0.0}, proposal_std=ppl_pstd)
+                # Wrap the (numpy) target in a torch log_prob_fn for our Model
+                def _tgt_logp(state, _fn=tgt_fn):
+                    x = state["x"]
+                    # tgt_fn returns scalar log-density in numpy; wrap as torch
+                    return torch.as_tensor(float(_fn(float(x))), dtype=torch.float64)
+                m_p = _pplt.Model().add_var("x")
+                m_p.set_log_prob(_tgt_logp)
+                mcp = _pplt.MCMC(m_p, init=[0.0])
                 with st.spinner("Sampling…"):
-                    chain_p = mcp.sample("metropolis", n_samples=int(ppl_nsamp), burn_in=500)
-                xs_p = np.array([s["x"] for s in chain_p])
-                st.session_state["ppl_samples"] = dict(xs=xs_p, rate=mcp.acceptance_rate,
+                    chain_p, rate_p = mcp.metropolis(
+                        n_samples=int(ppl_nsamp), burn_in=500,
+                        proposal_std=float(ppl_pstd), seed=int(ppl_seed))
+                xs_p = chain_p[:, 0]
+                st.session_state["ppl_samples"] = dict(xs=xs_p, rate=rate_p,
                                                         tgt=ppl_tgt_name, method="Metropolis")
 
             res_p = st.session_state["ppl_samples"]
-            if res_p:
+            if res_p and "xs" in res_p:
                 st.metric("Acceptance rate", f"{res_p['rate']:.1%}")
                 xs_p = res_p["xs"]
                 xr_p = TARGETS[res_p["tgt"]]["range"]
@@ -2185,63 +2195,70 @@ class MCMC:
     elif ppl_step == 3:
         L, R = st.columns([1, 1])
         with L:
-            st.markdown("## HMC in the PPL")
+            st.markdown("## HMC, powered by autograd")
             st.markdown("""
-HMC needs the **gradient** of log_prob with respect to the free variables.
-Production PPLs (PyMC, Stan, Pyro) compute this via symbolic or algorithmic
-differentiation.  Our PPL uses **central finite differences** — simple,
-works with any distribution class, correct to O(h²).
+HMC needs `∇ log p(q)` to drive the leapfrog integrator. Older versions of
+this PPL used finite differences — fine in 1-D, but they cost `O(n)`
+log-prob evaluations per gradient and the noise compounds in 50+ dimensions.
+
+With PyTorch we get the gradient in **one line**. Our distributions already
+return tensors; the joint log-prob is one differentiable graph; one call to
+`torch.autograd.grad` walks it and gives us the exact gradient.
+
+This is the headline jump: HMC's machinery is the same, but the gradient
+routine collapses from a loop to a function call.
 """)
             st.code("""\
-def _grad_log_prob(self, state, h=1e-4):
-    \"\"\"Numerical gradient via central finite differences.\"\"\"
-    g = {}
-    for k in self.model.free_vars:
-        s_p = {**state, k: state[k] + h}
-        s_m = {**state, k: state[k] - h}
-        g[k] = (self.model.log_prob(s_p)
-                - self.model.log_prob(s_m)) / (2 * h)
-    return g
+# Whole gradient — one differentiable pass through the model
+def grad_log_prob(self, q):
+    q_ = q.clone().detach().requires_grad_(True)
+    lp = self.model.log_prob(q_)
+    (g,) = torch.autograd.grad(lp, q_)
+    return lp.detach(), g.detach()
 
-def _hmc(self, n_samples, burn_in, step_size=0.05, n_leapfrog_steps=20):
-    keys = self.model.free_vars
+def hmc(self, n_samples, burn_in=500, step_size=0.05, n_leapfrog=20, seed=0):
+    torch.manual_seed(seed); rng = np.random.default_rng(seed)
+    q = self.init.clone()
+    chain, accepted = [], 0
+
     for i in range(n_samples + burn_in):
-        q = dict(self.current_state)
-        p = {k: float(np.random.standard_normal()) for k in keys}
+        p0 = torch.randn(q.shape, dtype=q.dtype)
 
-        # Half-step momentum, then L full leapfrog steps
-        g    = self._grad_log_prob(q)
-        p_hf = {k: p[k] + 0.5 * step_size * g[k] for k in keys}
-        q_new, p_new = dict(q), dict(p_hf)
-        for l in range(n_leapfrog_steps):
-            q_new = {k: q_new[k] + step_size * p_new[k] for k in keys}
-            g_new = self._grad_log_prob(q_new)
-            factor = 0.5 if l == n_leapfrog_steps - 1 else 1.0
-            p_new  = {k: p_new[k] + factor * step_size * g_new[k] for k in keys}
+        # Leapfrog — half-kick, drift-and-kick, terminal half-kick
+        q_new = q.clone()
+        log_p_q, g = self.grad_log_prob(q_new)
+        p_new = p0 + 0.5 * step_size * g
+        for L in range(n_leapfrog):
+            q_new = q_new + step_size * p_new
+            log_p_qn, g = self.grad_log_prob(q_new)
+            step = 0.5 if L == n_leapfrog - 1 else 1.0
+            p_new = p_new + step * step_size * g
 
-        H_curr = (-self.model.log_prob(q)
-                  + 0.5 * sum(p[k]**2 for k in keys))
-        H_prop = (-self.model.log_prob(q_new)
-                  + 0.5 * sum(p_new[k]**2 for k in keys))
-
-        if np.log(np.random.rand()) < H_curr - H_prop:
-            self.current_state = q_new
-            if i >= burn_in: self.accepted += 1
-        self.proposed += 1
+        H_curr = -float(log_p_q)  + 0.5 * float((p0    ** 2).sum())
+        H_prop = -float(log_p_qn) + 0.5 * float((p_new ** 2).sum())
+        if np.log(rng.random()) < (H_curr - H_prop):
+            q = q_new.detach()
+            if i >= burn_in: accepted += 1
         if i >= burn_in:
-            self.chain.append(self.current_state.copy())
+            chain.append(q.detach().numpy().copy())
+
+    return np.array(chain), accepted / max(n_samples, 1)
 """, language="python")
 
-            st.info("""
-**Why not autograd / JAX here?**
-The distribution classes call `scipy.stats`, which isn't differentiable by
-autograd.  A production PPL rewrites its math in a differentiable backend
-(pytensor, torch, jax) from the start.  Our numerical gradients are exact
-to O(h²) and completely general.
+            st.success("""
+**The autodiff payoff.** Compare with finite differences: in `n` dimensions
+we'd need `2n` log-prob evaluations *per leapfrog step*. Autograd costs
+≈ 2× a forward pass regardless of `n`. That's why every modern PPL
+(Stan/PyMC/NumPyro/Pyro) is built on a tensor library.
 """)
 
         with R:
             st.markdown("### Compare Metropolis vs HMC on the same target")
+            st.caption(
+                "We use a torch-tensor target here so HMC actually has a "
+                "differentiable graph. The 1-D distributions are smooth, so "
+                "autograd handles every example."
+            )
             ppl_tgt_h = st.selectbox(
                 "Target", ["Standard Normal", "Bimodal Mixture", "Student-t (df=3)"],
                 key="ppl_hmc_tgt"
@@ -2252,30 +2269,37 @@ to O(h²) and completely general.
             h_n     = st.slider("n_samples each",        500, 3000, 1500, 500, key="ppl_hn")
             h_seed  = st.number_input("Seed", 0, 999, 7, key="ppl_hsd")
 
+            # Differentiable torch versions of the same three targets
+            def _torch_log_target(name, x):
+                if name == "Standard Normal":
+                    return td.Normal(_pplt._t(0.0), _pplt._t(1.0)).log_prob(x)
+                if name == "Bimodal Mixture":
+                    c1 = td.Normal(_pplt._t(-2.0), _pplt._t(0.7)).log_prob(x)
+                    c2 = td.Normal(_pplt._t( 2.0), _pplt._t(0.7)).log_prob(x)
+                    return torch.logsumexp(torch.stack([c1, c2]), dim=0) \
+                           + torch.log(_pplt._t(0.5))
+                # Student-t df=3
+                return td.StudentT(_pplt._t(3.0), _pplt._t(0.0), _pplt._t(1.0)).log_prob(x)
+
             if st.button("Run both", type="primary", key="ppl_run_both"):
-                tgt_fn2 = TARGETS[ppl_tgt_h]["fn"]
-                class _Dist2:
-                    def __init__(self, fn): self.fn = fn
-                    def log_prob(self, x): return float(self.fn(x))
-                np.random.seed(int(h_seed))
-                # Metropolis
-                m_mh2 = _ppl.Model(); m_mh2.add_variable("x", _Dist2(tgt_fn2))
-                mc_mh = _ppl.MCMC(m_mh2, {"x": 0.0}, p_std_h)
+                def _logp_state(state, _name=ppl_tgt_h):
+                    return _torch_log_target(_name, state["x"])
+                m_t = _pplt.Model().add_var("x")
+                m_t.set_log_prob(_logp_state)
+
+                mc = _pplt.MCMC(m_t, init=[0.0])
                 with st.spinner("Metropolis…"):
-                    ch_mh = mc_mh.sample("metropolis", int(h_n), 500)
-                # HMC
-                np.random.seed(int(h_seed))
-                m_hm2 = _ppl.Model(); m_hm2.add_variable("x", _Dist2(tgt_fn2))
-                mc_hm = _ppl.MCMC(m_hm2, {"x": 0.0}, 0.1)
-                with st.spinner("HMC…"):
-                    ch_hm = mc_hm.sample("hmc", int(h_n), 500,
-                                          step_size=h_ss, n_leapfrog_steps=int(h_L))
-                xs_mh = np.array([s["x"] for s in ch_mh])
-                xs_hm = np.array([s["x"] for s in ch_hm])
-                st.session_state["ppl_samples"] = dict(xs_mh=xs_mh, xs_hm=xs_hm,
-                                                        mh_rate=mc_mh.acceptance_rate,
-                                                        hm_rate=mc_hm.acceptance_rate,
-                                                        tgt=ppl_tgt_h, mode="compare")
+                    ch_mh, mh_rate = mc.metropolis(
+                        int(h_n), 500, proposal_std=float(p_std_h), seed=int(h_seed))
+                with st.spinner("HMC (autograd)…"):
+                    ch_hm, hm_rate = mc.hmc(
+                        int(h_n), 500, step_size=float(h_ss),
+                        n_leapfrog=int(h_L), seed=int(h_seed))
+
+                st.session_state["ppl_samples"] = dict(
+                    xs_mh=ch_mh[:, 0], xs_hm=ch_hm[:, 0],
+                    mh_rate=mh_rate, hm_rate=hm_rate,
+                    tgt=ppl_tgt_h, mode="compare")
 
             res_h = st.session_state["ppl_samples"]
             if res_h and res_h.get("mode") == "compare":
@@ -2314,59 +2338,66 @@ to O(h²) and completely general.
 
     # ── PPL Step 4: Random effects demo ───────────────────────────────────────
     elif ppl_step == 4:
-        st.markdown("## Full demo — random effects model")
+        st.markdown("## Full demo — random effects, sampled by autograd HMC")
         st.markdown(r"""
 We fit a hierarchical model to simulated classroom data:
 $$y_{ij} = \mu + u_i + \varepsilon_{ij}$$
-- **μ** — global mean (prior: N(0, 5))
-- **u_i** — group-specific random effects (prior: N(0, σ_u²))
-- **σ_u** — between-group SD (prior: HalfNormal(1))
-- **σ_e** — within-group SD (prior: HalfNormal(1))
+- **μ** — global mean (prior: $\mathcal{N}(0, 5)$)
+- **u_i** — group-specific random effects ($u_i \sim \mathcal{N}(0, \sigma_u)$)
+- **σ_u, σ_e** — between- and within-group SDs ($\text{LogNormal}(0, 1)$)
 - **y_ij** — observed, 5 groups × 20 observations
+
+The free parameters are `(mu, log_sigma_u, log_sigma_e, u_0..u_4)` ∈ ℝ⁸.
+HMC sees all 8 dimensions at once and gets the gradient in one autograd
+pass — exactly the regime where finite differences would have hurt.
 """)
 
         code_col, ctrl_col = st.columns([3, 1])
         with ctrl_col:
-            re_nsamp  = st.slider("n_samples", 1000, 6000, 3000, 500, key="ppl_re_n")
-            re_burn   = st.slider("burn_in",    500, 2000, 1000, 500, key="ppl_re_b")
-            re_pstd   = st.slider("proposal_std", 0.02, 0.3, 0.08, 0.01, key="ppl_re_std")
-            run_re    = st.button("Run sampler", type="primary", key="ppl_run_re")
+            re_nsamp = st.slider("n_samples",  500, 4000, 1500, 500, key="ppl_re_n")
+            re_burn  = st.slider("burn_in",    300, 2000,  800, 100, key="ppl_re_b")
+            re_ss    = st.slider("HMC step_size", 0.01, 0.20, 0.06, 0.01, key="ppl_re_ss")
+            re_L     = st.slider("HMC leapfrog steps", 5, 40, 20, 1, key="ppl_re_L")
+            run_re   = st.button("Run HMC", type="primary", key="ppl_run_re")
 
         with code_col:
             st.code("""\
 # ── Simulate data ─────────────────────────────────────────────────────────────
 np.random.seed(42)
 n_groups, n_per = 5, 20
-true_mu      = 2.0
-true_sigma_u = 1.5   # between-group SD
-true_sigma_e = 0.5   # within-group SD
-group_ids    = np.repeat(np.arange(n_groups), n_per)
-true_u       = np.random.normal(0, true_sigma_u, n_groups)
-y_obs        = (true_mu + true_u[group_ids]
-                + np.random.normal(0, true_sigma_e, n_groups * n_per))
+true_mu, true_sigma_u, true_sigma_e = 2.0, 1.5, 0.5
+group_ids = np.repeat(np.arange(n_groups), n_per)
+true_u    = np.random.normal(0, true_sigma_u, n_groups)
+y_obs     = (true_mu + true_u[group_ids]
+             + np.random.normal(0, true_sigma_e, n_groups * n_per))
 
-# ── Build model ───────────────────────────────────────────────────────────────
-model   = Model()
-mu      = model.add_variable('mu',      Normal(0, 5))
-sigma_u = model.add_variable('sigma_u', HalfNormal(1))
-sigma_e = model.add_variable('sigma_e', HalfNormal(1))
-u       = [model.add_variable(f'u_{i}', Normal(0, 1), parents=[sigma_u])
-           for i in range(n_groups)]
+# ── Build model — 8-D flat parameter (mu, log_su, log_se, u_0..u_4) ──────────
+y_t   = torch.as_tensor(y_obs, dtype=torch.float64)
+gid_t = torch.as_tensor(group_ids, dtype=torch.long)
 
-# NormalVecLikelihood scores all observations at once
-mu_obs  = model.add_deterministic(
-    'mu_obs',
-    lambda: mu.value + np.array([u[g].value for g in group_ids]),
-    parents=[mu, *u])
-y = model.add_variable('y',
-    NormalVecLikelihood(mu_obs, sigma_e, y_obs),
-    parents=[mu_obs, sigma_e], observed=True)
+def log_prob_fn(state):
+    mu          = state['mu']
+    sigma_u     = torch.exp(state['log_sigma_u'])
+    sigma_e     = torch.exp(state['log_sigma_e'])
+    u           = state['u']                       # shape (n_groups,)
 
-# ── Sample ────────────────────────────────────────────────────────────────────
-init = {'mu': 0.0, 'sigma_u': 1.0, 'sigma_e': 1.0,
-        **{f'u_{i}': 0.0 for i in range(n_groups)}}
-mcmc = MCMC(model, initial_state=init, proposal_std=0.08)
-samples = mcmc.sample('metropolis', n_samples=3000, burn_in=1000)
+    lp  = Normal(0.0, 5.0).log_prob(mu)
+    lp += LogNormal(0.0, 1.0).log_prob(sigma_u) + state['log_sigma_u']  # Jacobian
+    lp += LogNormal(0.0, 1.0).log_prob(sigma_e) + state['log_sigma_e']
+    lp += Normal(0.0, sigma_u).log_prob(u)         # group-level prior
+    lp += Normal(mu + u[gid_t], sigma_e).log_prob(y_t)  # likelihood
+    return lp
+
+model = Model()
+model.add_var('mu').add_var('log_sigma_u').add_var('log_sigma_e')
+model.add_var('u', shape=(n_groups,))
+model.set_log_prob(log_prob_fn)
+
+# ── Sample with autograd HMC ──────────────────────────────────────────────────
+init    = np.zeros(model.n_dim)            # 8-D zero vector
+mcmc    = MCMC(model, init=init)
+chain, rate = mcmc.hmc(n_samples=1500, burn_in=800,
+                       step_size=0.06, n_leapfrog=20)
 """, language="python")
 
         if run_re:
@@ -2380,43 +2411,65 @@ samples = mcmc.sample('metropolis', n_samples=3000, burn_in=1000)
             y_obs_re        = (true_mu_re + true_u_re[group_ids_re]
                                + np.random.normal(0, true_sigma_e_re, n_groups * n_per))
 
-            model_re = _ppl.Model()
-            mu_re    = model_re.add_variable("mu",      _ppl.Normal(0, 5))
-            su_re    = model_re.add_variable("sigma_u", _ppl.HalfNormal(1))
-            se_re    = model_re.add_variable("sigma_e", _ppl.HalfNormal(1))
-            u_re     = [model_re.add_variable(f"u_{i}", _ppl.Normal(0, 1), parents=[su_re])
-                        for i in range(n_groups)]
-            mu_obs_re = model_re.add_deterministic(
-                "mu_obs",
-                lambda: mu_re.value + np.array([u_re[g].value for g in group_ids_re]),
-                parents=[mu_re, *u_re])
-            model_re.add_variable("y", _ppl.NormalVecLikelihood(mu_obs_re, se_re, y_obs_re),
-                                   parents=[mu_obs_re, se_re], observed=True, observed_data=y_obs_re)
+            y_t   = torch.as_tensor(y_obs_re, dtype=torch.float64)
+            gid_t = torch.as_tensor(group_ids_re, dtype=torch.long)
 
-            init_re = {"mu": 0.0, "sigma_u": 1.0, "sigma_e": 1.0,
-                       **{f"u_{i}": 0.0 for i in range(n_groups)}}
-            mc_re = _ppl.MCMC(model_re, initial_state=init_re, proposal_std=float(re_pstd))
-            with st.spinner(f"Running Metropolis ({int(re_nsamp)} samples, burn-in {int(re_burn)})…"):
-                samples_re = mc_re.sample("metropolis", int(re_nsamp), int(re_burn))
+            def _re_logp(state):
+                mu      = state["mu"]
+                log_su  = state["log_sigma_u"]
+                log_se  = state["log_sigma_e"]
+                sigma_u = torch.exp(log_su)
+                sigma_e = torch.exp(log_se)
+                u_vec   = state["u"]
+
+                lp  = _pplt.Normal(0.0, 5.0).log_prob(mu)
+                lp = lp + _pplt.LogNormal(0.0, 1.0).log_prob(sigma_u) + log_su
+                lp = lp + _pplt.LogNormal(0.0, 1.0).log_prob(sigma_e) + log_se
+                lp = lp + _pplt.Normal(0.0, sigma_u).log_prob(u_vec)
+                mu_obs = mu + u_vec[gid_t]
+                lp = lp + _pplt.Normal(mu_obs, sigma_e).log_prob(y_t)
+                return lp
+
+            model_re = _pplt.Model()
+            (model_re
+                .add_var("mu")
+                .add_var("log_sigma_u")
+                .add_var("log_sigma_e")
+                .add_var("u", shape=(n_groups,)))
+            model_re.set_log_prob(_re_logp)
+
+            init_re = np.zeros(model_re.n_dim)
+            mc_re = _pplt.MCMC(model_re, init=init_re)
+            with st.spinner(f"Running autograd HMC ({int(re_nsamp)} samples, burn-in {int(re_burn)})…"):
+                chain_re, rate_re = mc_re.hmc(
+                    int(re_nsamp), int(re_burn),
+                    step_size=float(re_ss), n_leapfrog=int(re_L), seed=42)
+
+            # Unpack flat chain into per-parameter arrays
+            mu_chain = chain_re[:, 0]
+            su_chain = np.exp(chain_re[:, 1])
+            se_chain = np.exp(chain_re[:, 2])
+            u_chains = [chain_re[:, 3 + i] for i in range(n_groups)]
+
             st.session_state["ppl_samples"] = dict(
                 mode="re",
-                samples=samples_re,
-                rate=mc_re.acceptance_rate,
+                mu_chain=mu_chain, su_chain=su_chain, se_chain=se_chain,
+                u_chains=u_chains,
+                rate=rate_re,
                 true_mu=true_mu_re, true_su=true_sigma_u_re, true_se=true_sigma_e_re,
                 true_u=true_u_re, n_groups=n_groups,
             )
 
         res_re = st.session_state["ppl_samples"]
         if res_re and res_re.get("mode") == "re":
-            st.metric("Acceptance rate", f"{res_re['rate']:.1%}")
-            samps = res_re["samples"]
+            st.metric("HMC acceptance rate", f"{res_re['rate']:.1%}")
             params_re = {
-                "mu":      (np.array([s["mu"]      for s in samps]), res_re["true_mu"],  C_BLUE),
-                "sigma_u": (np.array([s["sigma_u"] for s in samps]), res_re["true_su"],  C_ORANGE),
-                "sigma_e": (np.array([s["sigma_e"] for s in samps]), res_re["true_se"],  C_GREEN),
+                "mu":      (res_re["mu_chain"], res_re["true_mu"],  C_BLUE),
+                "sigma_u": (res_re["su_chain"], res_re["true_su"],  C_ORANGE),
+                "sigma_e": (res_re["se_chain"], res_re["true_se"],  C_GREEN),
             }
             ng = res_re["n_groups"]
-            u_chains_re = [np.array([s[f"u_{i}"] for s in samps]) for i in range(ng)]
+            u_chains_re = res_re["u_chains"]
 
             fig_re, axes_re = plt.subplots(3, 3, figsize=(13, 9))
             fig_re.suptitle("Random Effects Model — Posterior Diagnostics",
