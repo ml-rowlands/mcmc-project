@@ -661,561 +661,342 @@ tab_ov, tab_mh, tab_hmc, tab_cmp, tab_ppl, tab_pheno = st.tabs([
 with tab_ov:
     st.title("Markov Chain Monte Carlo — Interactive Explorer")
 
+
     OV_LABELS = [
-        "Three ways to learn from data",
-        "Bayes' theorem, gently",
-        "Why be Bayesian?",
-        "The intractability wall",
-        "MCMC to the rescue",
+        "The wildflower problem",
+        "Two kinds of uncertainty",
+        "Why MCMC?",
     ]
     ov_step = step_nav("ov_step", OV_LABELS)
 
-    # ── Step 0: Three ways to learn from data ──────────────────────────────────
+    # Pull the same dataset the Phenology tab uses, so the Overview is a
+    # genuine preview of where we end up.
+    T_daily_ov, doy_obs_ov, years_ov, true_params_ov = generate_phenology_data()
+
+    # ── Step 0: The wildflower problem ─────────────────────────────────────────
     if ov_step == 0:
-        st.markdown("## Three ways to learn from data")
+        st.markdown("## When do wildflowers bloom?")
         st.markdown(r"""
-You have some **data** and a **model** with unknown parameters.
-**Running example for the entire Overview:** simple linear regression.
-We observe $N$ pairs $(x_i, y_i)$ and assume
+We're going to spend this talk on **one motivating problem**, then build the
+machinery to solve it. Here it is.
 
-$$y_i = \beta_0 + \beta_1\, x_i + \varepsilon_i, \qquad \varepsilon_i \sim \mathcal{N}(0,\sigma).$$
+A field ecologist has 40 years of data: for each year, the **daily temperature
+record** at the site, and the **day of the year on which the first flower
+opened**. They want to know how bloom timing depends on climate — and to
+project what bloom dates will look like in a warmer future.
 
-The unknowns are the intercept $\beta_0$, the slope $\beta_1$, and the noise scale $\sigma$.
-The job of *statistical inference* is to use the data to say something about them.
-Three communities answer that question very differently.
+**The science.** Plants don't bloom on a fixed calendar date. They bloom once
+they've absorbed enough cumulative warmth. Ecologists model that with
+*growing degree days* (GDD): on each day above a base temperature
+$T_{\text{base}}$, the plant gets credit for $T(t) - T_{\text{base}}$ heat
+units. Bloom happens the first day total accumulated heat crosses a
+species-specific threshold $H^\star$ (after some start day $t_0$). We don't
+observe $t^\star$ perfectly — there's measurement noise $\sigma$.
+
+So we have **four unknowns** — $T_{\text{base}}$, $H^\star$, $t_0$, $\sigma$ —
+and we want to learn them from the data.
 """)
-        col_l, col_r = st.columns([1, 1])
 
-        with col_l:
+        c1, c2 = st.columns([1, 1])
+
+        with c1:
+            st.markdown("### One year of the model")
+            st.caption(
+                "Daily temperature stacks up GDDs once it exceeds "
+                "$T_{\text{base}}$ and the start day $t_0$ has passed. "
+                "Bloom is the first day cumulative heat crosses $H^\star$."
+            )
+
+            tp = true_params_ov
+            T_ex = T_daily_ov[0]
+            gdd_ex = np.maximum(T_ex - tp["T_base"], 0.0)
+            gdd_ex[: int(tp["t0"])] = 0.0
+            H_cum_ex = np.cumsum(gdd_ex)
+            bloom_day_ex = int(np.argmax(H_cum_ex >= tp["H_star"]) + 1)
+
+            fig_ode_ov, (ax_t_ov, ax_h_ov) = plt.subplots(
+                2, 1, figsize=(7, 5), sharex=True)
+            days_plot = np.arange(1, 181)
+            ax_t_ov.plot(days_plot, T_ex[:180], color="steelblue", lw=1.4,
+                         label="Daily temperature")
+            ax_t_ov.axhline(tp["T_base"], color="gray", lw=1.0, ls="--",
+                            label=f"$T_{{\\rm base}}$ = {tp['T_base']:.0f}°C")
+            ax_t_ov.fill_between(days_plot, tp["T_base"],
+                                 np.maximum(T_ex[:180], tp["T_base"]),
+                                 alpha=0.25, color="tomato", label="Daily GDD")
+            ax_t_ov.set_ylabel("°C", fontsize=9)
+            ax_t_ov.legend(fontsize=8, loc="upper left")
+            ax_t_ov.set_title("Temperature → daily heat units", fontsize=10)
+
+            ax_h_ov.plot(days_plot, H_cum_ex[:180], color="tomato", lw=2,
+                         label="Cumulative GDD")
+            ax_h_ov.axhline(tp["H_star"], color="green", lw=1.4, ls="--",
+                            label=f"$H^\\star$ = {tp['H_star']:.0f}")
+            if bloom_day_ex <= 180:
+                ax_h_ov.axvline(bloom_day_ex, color="purple", lw=2,
+                                label=f"Bloom: day {bloom_day_ex}")
+            ax_h_ov.set_xlabel("Day of year", fontsize=9)
+            ax_h_ov.set_ylabel("Accumulated GDD", fontsize=9)
+            ax_h_ov.legend(fontsize=8, loc="upper left")
+            ax_h_ov.set_title("Heat crosses threshold → bloom event", fontsize=10)
+            plt.tight_layout()
+            st.pyplot(fig_ode_ov)
+            plt.close(fig_ode_ov)
+
+        with c2:
+            st.markdown("### 40 years of data")
+            st.caption(
+                "Each green dot is one observed first-bloom day. The model "
+                "above has to explain *every* dot from a single set of four "
+                "parameters."
+            )
+            p_trend = np.polyfit(years_ov - 1980, doy_obs_ov, 1)
+            trend_line = np.polyval(p_trend, years_ov - 1980)
+            fig_doy_ov = go.Figure()
+            fig_doy_ov.add_trace(go.Scatter(
+                x=years_ov, y=doy_obs_ov, mode="markers",
+                marker=dict(size=10, color=C_GREEN,
+                            line=dict(width=1, color="darkgreen")),
+                name="Observed bloom DOY"))
+            fig_doy_ov.add_trace(go.Scatter(
+                x=years_ov, y=trend_line, mode="lines",
+                line=dict(color="black", width=1.5, dash="dash"),
+                name=f"Trend: {p_trend[0]:+.2f} days / year"))
+            fig_doy_ov.update_layout(
+                xaxis_title="Year", yaxis_title="First-bloom day of year",
+                height=320, margin=dict(t=30, b=40),
+                legend=dict(x=0.02, y=0.02))
+            st.plotly_chart(fig_doy_ov, use_container_width=True)
+
             st.markdown("""
-### 1 · Frequentist statistics
-*"The parameters (β₀, β₁) are fixed, unknown numbers. Probability describes
-long-run frequencies of repeated experiments."*
+**The questions we actually care about.**
 
-- Reports a **point estimate** β̂₁ plus a **confidence interval**.
-- A 95 % CI does **not** mean "β₁ is in [a,b] with probability 95 %."
-  It means: if you repeated the whole data-collection experiment forever,
-  95 % of such intervals would cover the true β₁. Most people get this
-  wrong — including most users of it.
-- Uncertainty exists, but is awkward to talk about and hard to propagate.
+- *What are plausible values of* $T_{\text{base}}$ *and* $H^\star$ *for this species?*
+- *Given a hotter spring, when will the flower bloom — with honest error bars?*
+- *How likely is bloom by April 1st under a +2 °C scenario?*
 
-### 2 · Traditional ML  (MLE / MAP / "train a model")
-*"Pick the single (β₀, β₁) that fits the data best."*
+A single best-fit number for each parameter cannot answer any of these.
+We need a way to talk about **uncertainty**.
 """)
-            st.latex(r"(\hat{\beta}_0, \hat{\beta}_1) = \arg\max_{\beta_0, \beta_1} \; \log p(y \mid \beta_0, \beta_1)")
-            st.markdown("""
-- For Gaussian noise this is exactly **ordinary least squares** —
-  maximise log-likelihood ⇔ minimise sum of squared errors.
-- Logistic regression, neural networks, gradient boosting — same idea,
-  return **one** parameter vector and stop.
-- Test-set error tells you average performance, but the model has no notion of
-  *"how sure am I about this prediction?"* beyond a single number.
-- Works great with lots of data. Falls apart when data is scarce or decisions are costly.
+            st.info("Click **Next ▶** to see what \"uncertainty\" actually means here.")
 
-### 3 · Bayesian inference
-*"(β₀, β₁) are themselves uncertain. Represent that uncertainty with a
-probability distribution and update it as data arrive."*
-""")
-            st.latex(r"p(\beta_0, \beta_1 \mid y) \;\propto\; p(y \mid \beta_0, \beta_1)\, p(\beta_0, \beta_1)")
-            st.markdown("""
-- Output is a **full distribution** p(β₀, β₁ | y) — the *posterior* — not a single number.
-- Wide when data is scarce, narrow when data is abundant.
-  *The model knows what it doesn't know.*
-- Translates into an **ensemble of regression lines**, weighted by how plausible each is.
-- Probability statements mean what you'd naively expect:
-  "given my data, there's a 95 % chance β₁ ∈ [a, b]."
-
-**This talk is about MCMC — the algorithm that makes option 3 actually work in practice.**
-""")
-
-        with col_r:
-            st.markdown("### The same regression, through three lenses")
-            st.markdown(r"""
-True line: $y = 1.5 + 0.8\,x + \varepsilon$, $\varepsilon \sim \mathcal{N}(0, 1)$.
-Slide N from very few points to many and watch how each viewpoint reacts.
-""")
-            n_pts_0 = st.slider("Number of data points (N)",
-                                3, 100, 6, key="ov_npts_lr")
-
-            np.random.seed(42)
-            x_full_ov = np.random.uniform(0, 5, 100)
-            y_full_ov = 1.5 + 0.8 * x_full_ov + np.random.normal(0, 1.0, 100)
-            sigma_known = 1.0
-            tau_prior   = 5.0  # weak prior on (β₀, β₁)
-
-            x_obs0 = x_full_ov[:n_pts_0]
-            y_obs0 = y_full_ov[:n_pts_0]
-            X0 = np.column_stack([np.ones_like(x_obs0), x_obs0])
-
-            # Conjugate Gaussian posterior over (β₀, β₁) with known σ
-            Sigma_n0 = np.linalg.inv(
-                X0.T @ X0 / sigma_known**2 + np.eye(2) / tau_prior**2)
-            mu_n0 = Sigma_n0 @ (X0.T @ y_obs0) / sigma_known**2
-
-            # OLS / MLE
-            beta_mle0, *_ = np.linalg.lstsq(X0, y_obs0, rcond=None)
-
-            rng_lr0 = np.random.default_rng(7)
-            post_lines0 = rng_lr0.multivariate_normal(mu_n0, Sigma_n0, 60)
-
-            x_grid_lr = np.linspace(-0.3, 5.5, 80)
-            fig_lr0 = go.Figure()
-            for s in post_lines0:
-                fig_lr0.add_trace(go.Scatter(
-                    x=x_grid_lr, y=s[0] + s[1] * x_grid_lr,
-                    mode="lines",
-                    line=dict(color="rgba(99,110,250,0.10)", width=1.2),
-                    showlegend=False, hoverinfo="skip"))
-            fig_lr0.add_trace(go.Scatter(
-                x=x_grid_lr, y=beta_mle0[0] + beta_mle0[1] * x_grid_lr,
-                mode="lines", line=dict(color=C_GREEN, width=3, dash="dash"),
-                name="MLE / OLS line"))
-            fig_lr0.add_trace(go.Scatter(
-                x=x_grid_lr, y=1.5 + 0.8 * x_grid_lr,
-                mode="lines", line=dict(color=C_RED, width=2, dash="dot"),
-                name="True line"))
-            fig_lr0.add_trace(go.Scatter(
-                x=x_obs0, y=y_obs0, mode="markers",
-                marker=dict(size=10, color="black"),
-                name=f"Data (N = {n_pts_0})"))
-            fig_lr0.add_trace(go.Scatter(
-                x=[None], y=[None], mode="lines",
-                line=dict(color="rgba(99,110,250,0.5)", width=2),
-                name="Posterior samples"))
-            fig_lr0.update_layout(
-                title=f"N = {n_pts_0}",
-                xaxis_title="x", yaxis_title="y",
-                height=320, margin=dict(t=50, b=30),
-                legend=dict(x=0.02, y=0.98))
-            st.plotly_chart(fig_lr0, use_container_width=True)
-
-            slope_mu0 = mu_n0[1]
-            slope_sd0 = float(np.sqrt(Sigma_n0[1, 1]))
-            ci_lo0 = slope_mu0 - 1.96 * slope_sd0
-            ci_hi0 = slope_mu0 + 1.96 * slope_sd0
-
-            st.markdown(f"""
-**What each viewpoint reports about the slope β₁ at N = {n_pts_0}:**
-
-| Viewpoint | Output | Value |
-|---|---|---|
-| **ML / OLS (green dashed)** | one number β̂₁ | **{beta_mle0[1]:.3f}** |
-| **Frequentist** | β̂₁ + a 95 % CI from sampling theory | a fixed number, plus an interval *about the procedure* |
-| **Bayesian (blue cloud)** | full distribution p(β₁\\|y) | mean **{slope_mu0:.3f}**, 95 % credible interval **[{ci_lo0:.3f}, {ci_hi0:.3f}]** |
-
-*Try N = 3, then N = 100.* At N = 3 the OLS line will happily latch onto noise
-and report a slope wildly off from 0.8 — overconfidently. The Bayesian posterior
-is wide: the cloud of blue lines covers many plausible regressions. By N = 100,
-all three roughly agree — but only the Bayesian one was honest about uncertainty
-the whole way.
-""")
-            st.info("Click **Next ▶** to see how that posterior is actually computed.")
-
-    # ── Step 1: Bayes' theorem, gently ─────────────────────────────────────────
+    # ── Step 1: Two kinds of uncertainty ───────────────────────────────────────
     elif ov_step == 1:
-        st.markdown("## Bayes' theorem, gently")
-
-        col_l, col_r = st.columns([1, 1])
-
-        with col_l:
-            st.markdown("""
-Bayes' theorem is a one-line consequence of the definition of conditional probability:
-P(A and B) = P(A | B) · P(B) = P(B | A) · P(A). Rearrange and you get:
-""")
-            st.latex(r"""
-\underbrace{p(\theta \mid y)}_{\substack{\text{posterior} \\ \text{(what we want)}}}
-= \frac{
-    \underbrace{p(y \mid \theta)}_{\substack{\text{likelihood} \\ \text{(model)}}}
-    \;\cdot\;
-    \underbrace{p(\theta)}_{\substack{\text{prior} \\ \text{(belief before data)}}}
-}{
-    \underbrace{p(y)}_{\substack{Z \\ \text{(normaliser)}}}
-}
-""")
-            st.markdown("""
-Read each piece in plain English:
-
-- **Prior** p(θ) — what we believed about θ *before* seeing any data.
-  *(Think: the regulariser in ridge regression, or the initial weights of a network — every ML method has one, often hidden.)*
-- **Likelihood** p(y | θ) — for a candidate θ, how probable is the data we actually observed?
-  *(This is exactly the loss function in MLE, before the negative-log.)*
-- **Posterior** p(θ | y) — updated belief *after* seeing the data. **The output.**
-- **Evidence** Z = ∫ p(y | θ) p(θ) dθ — a single number that makes the posterior integrate to 1.
-
-Because Z does not depend on θ, we almost always write:
-""")
-            st.latex(r"p(\theta \mid y) \;\propto\; p(y \mid \theta) \cdot p(\theta)")
-            st.markdown("""
-**Two things that fall out for free:**
-
-1. **Sequential updating.** Today's posterior is tomorrow's prior. Want to add a
-   new batch of data? Just multiply by its likelihood. No retraining from scratch.
-2. **Probability statements that mean what you think they mean.** A 95 % Bayesian
-   *credible* interval really does mean "given the data, P(θ ∈ [a,b]) = 0.95."
-   A frequentist *confidence* interval does **not** — it's a statement about the
-   procedure, not about θ.
+        st.markdown("## Two kinds of uncertainty")
+        st.markdown("""
+There are two distinct uncertainties in this problem. Both matter, and they
+multiply when we make predictions.
 """)
 
-        with col_r:
-            st.markdown("### Bayes' theorem on our linear regression")
-            st.markdown(r"Apply Bayes' rule to $y = \beta_0 + \beta_1 x + \varepsilon$:")
-            st.latex(r"""
-p(\beta_0, \beta_1 \mid y) \;\propto\;
-\underbrace{\prod_{i=1}^N \mathcal{N}\!\bigl(y_i \mid \beta_0 + \beta_1 x_i,\,\sigma\bigr)}_{\text{likelihood}}
-\;\cdot\;
-\underbrace{p(\beta_0)\, p(\beta_1)}_{\text{prior}}
+        c1, c2 = st.columns([1, 1])
+
+        with c1:
+            st.markdown("### 1 · Uncertainty *about the parameters* (θ)")
+            st.markdown(r"""
+With only 40 years of noisy data, several different
+$(T_{\text{base}}, H^\star, t_0, \sigma)$ combinations could explain what
+we saw roughly equally well. We don't know θ exactly — we know **a range
+of plausible values**.
+
+A traditional fit (least-squares, MLE) returns a single best θ̂. That's like
+reporting "the average height in this room is 5'9″" with no spread —
+technically true, mostly useless.
+
+Below: instead of *one* θ, imagine drawing **a cloud of plausible θ's**
+that all fit the data reasonably. Each one defines a slightly different
+model curve.
 """)
-            st.markdown("""
-- **Likelihood** — Gaussian noise around the line. Maximising it ⇔ minimising
-  sum-of-squared-errors. That's just OLS in disguise.
-- **Prior** — beliefs about (β₀, β₁) before seeing data. A Normal(0, τ²) prior
-  on β₁ is *literally* L2 regularisation / ridge regression with λ = σ²/τ².
-  Every regularised regression you've trained is a secret Bayesian model with a hidden prior.
-- **Posterior** — a 2-D distribution over (β₀, β₁). For this Gaussian model
-  it's closed-form. Tweak almost anything (Student-t errors, heteroscedasticity,
-  hierarchy across groups, non-linear features) and it's not. *Then we need MCMC.*
 
----
+            # Draw a cartoon "cloud of plausible H_star vs T_base" by jittering
+            # around the true values. (No real fit — just to make the idea visible.)
+            rng_cl = np.random.default_rng(11)
+            cloud_T  = rng_cl.normal(true_params_ov["T_base"], 0.6, 200)
+            cloud_H  = rng_cl.normal(true_params_ov["H_star"], 12.0, 200)
+            fig_cl = go.Figure()
+            fig_cl.add_trace(go.Scatter(
+                x=cloud_T, y=cloud_H, mode="markers",
+                marker=dict(size=6, color="rgba(99,110,250,0.4)",
+                            line=dict(width=0)),
+                name="Plausible θ"))
+            fig_cl.add_trace(go.Scatter(
+                x=[true_params_ov["T_base"]], y=[true_params_ov["H_star"]],
+                mode="markers", marker=dict(size=14, color=C_RED, symbol="x",
+                                            line=dict(width=2)),
+                name="MLE / best fit"))
+            fig_cl.update_layout(
+                xaxis_title="T_base", yaxis_title="H_star",
+                title="A cloud of plausible parameters",
+                height=300, margin=dict(t=50, b=40),
+                legend=dict(x=0.02, y=0.98))
+            st.plotly_chart(fig_cl, use_container_width=True)
+
+        with c2:
+            st.markdown("### 2 · Uncertainty *about future outcomes* (y\*)")
+            st.markdown(r"""
+Even if we knew θ exactly, bloom day $t^\star$ would still vary year to
+year because temperature is random. With θ *also* uncertain, the prediction
+is doubly fuzzy.
+
+Below: pick a future spring scenario. We push each plausible θ from the
+left through the bloom model and look at the **distribution of predicted
+bloom days**. That distribution — not a single number — is what a
+policymaker actually needs.
 """)
-            st.markdown("### Prior sensitivity — same 8 points, three priors on β₁")
 
-            np.random.seed(42)
-            x_lr1 = np.random.uniform(0, 5, 8)
-            y_lr1 = 1.5 + 0.8 * x_lr1 + np.random.normal(0, 1.0, 8)
-            X1    = np.column_stack([np.ones_like(x_lr1), x_lr1])
-            sigma_known1 = 1.0
+            warm = st.slider("Warming scenario (°C added to spring)",
+                              0.0, 4.0, 1.5, 0.5, key="ov_warm")
 
-            prior_specs_lr = [
-                ("Strong:        β₁ ~ N(0, 0.1²)",  0.1, C_RED),
-                ("Moderate:      β₁ ~ N(0, 1²)",    1.0, C_GREEN),
-                ("Uninformative: β₁ ~ N(0, 10²)",  10.0, C_ORANGE),
-            ]
-            slope_grid = np.linspace(-0.4, 1.8, 400)
-            fig_sens = go.Figure()
-            for label, tau, col in prior_specs_lr:
-                Sigma_n1 = np.linalg.inv(
-                    X1.T @ X1 / sigma_known1**2
-                    + np.diag([1.0 / 100.0, 1.0 / tau**2]))
-                mu_n1    = Sigma_n1 @ (X1.T @ y_lr1) / sigma_known1**2
-                slope_pdf = stats.norm.pdf(
-                    slope_grid, mu_n1[1], float(np.sqrt(Sigma_n1[1, 1])))
-                fig_sens.add_trace(go.Scatter(
-                    x=slope_grid, y=slope_pdf, mode="lines",
-                    line=dict(color=col, width=2.5), name=label,
-                ))
-            fig_sens.add_vline(x=0.8, line_color="gray", line_dash="dot",
-                               annotation_text="true β₁ = 0.8",
-                               annotation_position="top right")
-            fig_sens.update_layout(
-                title="Same data, different priors → different posteriors on slope",
-                xaxis_title="β₁ (slope)", yaxis_title="Density",
-                height=260, margin=dict(t=50, b=30),
-                legend=dict(x=0.01, y=0.97, font=dict(size=10)),
-            )
-            st.plotly_chart(fig_sens, use_container_width=True)
-            st.caption(
-                "With only 8 points a strong prior pulls the slope toward zero. "
-                "With 100+ points the data dominates and all three posteriors "
-                "collapse around the truth. **Bayesian inference and "
-                "regularisation are the same idea seen from different angles.**"
+            # Build a synthetic future-year temperature trace by warming the
+            # average of the historical data uniformly.
+            T_future = T_daily_ov.mean(axis=0) + float(warm)
+
+            preds = []
+            for Tb, Hs in zip(cloud_T, cloud_H):
+                gdd = np.maximum(T_future - Tb, 0.0)
+                gdd[: int(true_params_ov["t0"])] = 0.0
+                Hc = np.cumsum(gdd)
+                doy = int(np.argmax(Hc >= Hs) + 1) if (Hc >= Hs).any() else 365
+                # Add observation noise too
+                doy = doy + rng_cl.normal(0, true_params_ov["sigma"])
+                preds.append(doy)
+            preds = np.array(preds)
+
+            fig_pr = go.Figure()
+            fig_pr.add_trace(go.Histogram(
+                x=preds, nbinsx=30, marker_color=C_GREEN, opacity=0.85,
+                name="Predicted bloom DOY"))
+            fig_pr.add_vline(x=np.median(preds), line_color="black",
+                             line_dash="dash",
+                             annotation_text=f"median = {np.median(preds):.0f}",
+                             annotation_position="top right")
+            fig_pr.update_layout(
+                title=f"Predicted bloom day under +{warm:.1f} °C",
+                xaxis_title="Day of year", yaxis_title="Count",
+                height=300, margin=dict(t=50, b=40),
+                showlegend=False)
+            st.plotly_chart(fig_pr, use_container_width=True)
+
+            lo, hi = np.percentile(preds, [5, 95])
+            st.markdown(
+                f"**90% predictive interval:** day **{lo:.0f}** — day **{hi:.0f}** "
+                f"(median day {np.median(preds):.0f})."
             )
 
-    # ── Step 2: Why be Bayesian? ───────────────────────────────────────────────
+        st.success(
+            "**The Bayesian picture in one line.** Replace each unknown with a "
+            "*distribution*, not a number. Run that distribution through the "
+            "model. Out comes a *distribution* of predictions — with proper "
+            "error bars on every quantity you care about."
+        )
+        st.info("Click **Next ▶** to see how we actually compute that cloud of θ's.")
+
+    # ── Step 2: Why MCMC? ──────────────────────────────────────────────────────
     elif ov_step == 2:
-        st.markdown("## Why be Bayesian?")
+        st.markdown("## Why MCMC?")
+        st.markdown(r"""
+We want a probability distribution over θ given the data — the **posterior**:
 
-        col_l, col_r = st.columns([1, 1])
+$$p(\theta \mid y) \;=\; \frac{p(y \mid \theta)\, p(\theta)}{p(y)}.$$
 
-        with col_l:
-            st.markdown("""
-A trained ML model returns one parameter vector θ̂. A Bayesian model returns a
-**distribution** p(θ | y). That extra structure buys real things:
+The numerator is easy:
+- $p(y \mid \theta)$ — run the GDD model with parameters $\theta$, score how
+  close its predicted bloom days are to the data. Just a function call.
+- $p(\theta)$ — our prior beliefs about reasonable parameter ranges.
+  Just a formula.
 
-| | Traditional ML (MLE / MAP) | Bayesian |
-|---|---|---|
-| **Output** | one parameter vector θ̂ | distribution p(θ \\| y) |
-| **Uncertainty** | not quantified | built in, by construction |
-| **Small-data behaviour** | overconfident; can latch onto noise | posterior just gets wider |
-| **Predictions** | one curve / one logit | ensemble of plausible curves |
-| **New data** | retrain from scratch | multiply by new likelihood |
-| **Decision-making** | point predictions | full posterior → expected utility |
-
-**The small-data problem is real and CS-relevant.**
-6 data points, 2 parameters (β₀, β₁): OLS returns one confident line. But *many*
-lines fit nearly as well — and which one you picked matters when the model has to act.
-""")
-            st.info("""
-**A CS-flavoured example.**
-You're predicting **server response time** as a linear function of **request rate**
-from 6 noisy load-test measurements (essentially the plot on the right).
-
-- **Plain ML / OLS:** returns one line. To answer *"what's the response time at
-  2× current load?"* it gives a single number — confidently overshooting or
-  undershooting based on whichever 6 points you happened to measure.
-- **Bayesian model:** returns a *family* of lines. The posterior predictive
-  at 2× load is a *distribution* over response times — directly usable for
-  capacity planning, SLO budgeting, or "what's my P95 prediction?"
-
-Bayesian inference is not exotic — it's the principled version of things CS already does.
+The denominator $p(y) = \int p(y \mid \theta)\, p(\theta)\, d\theta$ is a
+4-D integral over a forward simulator. There is no closed form, and naive
+numerical integration explodes with dimension. **This is the wall every
+real Bayesian problem hits.**
 """)
 
-        with col_r:
-            st.markdown("### Posterior vs MAP — 6 data points")
-            st.markdown("""
-6 noisy observations from y = β₀ + β₁ x + ε. Each **blue line** is one draw
-from the posterior over (β₀, β₁) — a plausible regression line. The **red line**
-is the MAP estimate (single best answer).
+        c1, c2 = st.columns([1, 1])
 
-With only 6 points the posterior is a *family* of lines, not one line.
+        with c1:
+            st.markdown("### MCMC's idea, in one sentence")
+            st.markdown(r"""
+We don't need $p(y)$ if all we want are **samples** from $p(\theta \mid y)$.
+
+**MCMC** designs a Markov chain whose stationary distribution is exactly the
+posterior. Run it long enough and the sequence of states $\theta_1,
+\theta_2, \theta_3, \dots$ behaves like a sample from
+$p(\theta \mid y)$ — even though we never computed the normalising constant.
+
+Each step only needs a *ratio*
+$p(y\mid\theta')p(\theta') \big/ p(y\mid\theta)p(\theta)$,
+and the unknown $p(y)$ cancels.
+
+**The output we actually care about** is the cloud itself: 1000s of plausible
+$\theta$'s. From that cloud everything follows:
+- **Marginal posteriors** — histogram each parameter.
+- **Credible intervals** — percentiles of those histograms.
+- **Predictive distributions** — push each $\theta$ through the model.
+- **Probabilities of events** — fraction of samples where bloom < April 1st.
 """)
-            np.random.seed(11)
-            x_tiny_lr = np.array([0.5, 1.2, 2.0, 3.0, 4.2, 4.8])
-            y_tiny_lr = 1.5 + 0.8 * x_tiny_lr + np.random.normal(0, 1.0, 6)
-            X_t       = np.column_stack([np.ones_like(x_tiny_lr), x_tiny_lr])
-            sigma_t   = 1.0
-            tau_t     = 3.0
-            Sigma_t   = np.linalg.inv(
-                X_t.T @ X_t / sigma_t**2 + np.eye(2) / tau_t**2)
-            mu_t      = Sigma_t @ (X_t.T @ y_tiny_lr) / sigma_t**2
 
-            rng_t   = np.random.default_rng(33)
-            post_t  = rng_t.multivariate_normal(mu_t, Sigma_t, 80)
-
-            x_curve = np.linspace(-0.5, 5.8, 200)
-            fig_lr2 = go.Figure()
-            for s in post_t:
-                fig_lr2.add_trace(go.Scatter(
-                    x=x_curve, y=s[0] + s[1] * x_curve, mode="lines",
-                    line=dict(color="rgba(99,110,250,0.08)", width=1.5),
-                    showlegend=False, hoverinfo="skip",
-                ))
-            fig_lr2.add_trace(go.Scatter(
-                x=x_curve, y=mu_t[0] + mu_t[1] * x_curve, mode="lines",
-                line=dict(color=C_RED, width=3), name="MAP (single estimate)",
-            ))
-            fig_lr2.add_trace(go.Scatter(
-                x=x_tiny_lr, y=y_tiny_lr, mode="markers",
-                marker=dict(size=12, color="black"), name="Data",
-            ))
-            fig_lr2.add_trace(go.Scatter(
-                x=[None], y=[None], mode="lines",
-                line=dict(color="rgba(99,110,250,0.5)", width=2),
-                name="Posterior samples",
-            ))
-            fig_lr2.update_layout(
-                title="Posterior samples vs MAP — 6 noisy points",
-                xaxis_title="x", yaxis_title="y",
-                height=330, margin=dict(t=50, b=30),
-                legend=dict(x=0.02, y=0.97),
-            )
-            st.plotly_chart(fig_lr2, use_container_width=True)
+        with c2:
+            st.markdown("### A live MCMC chain")
             st.caption(
-                "MAP picks the most likely single line and discards all ambiguity. "
-                "The posterior retains every plausible line — weighted by how well "
-                "it fits the data and how reasonable the prior considers it. "
-                "If you're forecasting y at x = 7, the *width* of the ensemble "
-                "out there is your honest predictive uncertainty."
+                "Toy 2-D posterior (curved ridge — like the "
+                "$T_{\text{base}}$ vs $H^\star$ trade-off). Drag the slider to "
+                "watch the chain's footprint *become* the posterior."
             )
 
-    # ── Step 3: The intractability wall ────────────────────────────────────────
-    elif ov_step == 3:
-        st.markdown("## So why isn't everyone Bayesian already?")
+            n_steps_demo = st.slider("Steps taken", 100, 4000, 800,
+                                      step=100, key="ov_mcmc_steps")
 
-        col_l, col_r = st.columns([1, 1])
+            def _banana_logp(x, y):
+                return -0.5 * (x**2 + (y - 0.5*(x**2 - 1.0))**2)
 
-        with col_l:
-            st.markdown("""
-The catch lives in the denominator of Bayes' rule. To actually *write down*
-the posterior as a probability distribution, you need the normaliser Z:
-""")
-            st.latex(r"p(\theta \mid y) = \frac{p(y \mid \theta)\,p(\theta)}{Z}, \qquad Z = \int p(y \mid \theta)\,p(\theta)\;d\theta")
-            st.markdown("""
-Our running example — Gaussian linear regression with Gaussian priors — is one
-of the *rare conjugate models* where Z does have a closed form. That's why we
-could draw those clean ensembles of lines without an algorithm.
+            rng_d = np.random.default_rng(0)
+            cx, cy = 0.0, 0.0
+            log_p = _banana_logp(cx, cy)
+            chain_x = np.empty(n_steps_demo); chain_y = np.empty(n_steps_demo)
+            for k in range(n_steps_demo):
+                px = cx + rng_d.normal(0, 0.6)
+                py = cy + rng_d.normal(0, 0.6)
+                lp_p = _banana_logp(px, py)
+                if np.log(rng_d.random()) < lp_p - log_p:
+                    cx, cy, log_p = px, py, lp_p
+                chain_x[k] = cx; chain_y[k] = cy
 
-**Change almost anything and that closed form disappears.** Robust regression
-with Student-t errors, a logistic likelihood for classification, hierarchical
-priors across groups, non-linear features, a neural network — for any of these,
-**Z has no closed-form solution.** It's a high-dimensional integral.
+            gx = np.linspace(-3, 3, 80); gy = np.linspace(-2, 4, 80)
+            GX, GY = np.meshgrid(gx, gy)
+            GZ = np.exp(_banana_logp(GX, GY))
 
-The obvious fallback is to compute it numerically: lay down a grid in
-parameter space and sum. This collapses immediately as D grows.
-
-**Grid integration cost: G^D evaluations** (D = number of parameters)
-""")
-            grid_data = {
-                "Parameters D": [1, 2, 5, 10, 20, 50],
-                "Grid pts / dim": [1000, 100, 100, 100, 10, 10],
-                "Evaluations needed": ["10³", "10⁴", "10¹⁰", "10²⁰", "10²⁰", "10⁵⁰"],
-                "Time @ 10⁹/s": ["instant", "instant", "10 s", "3×10³ yr", "3×10³ yr", "3×10³³ yr"],
-            }
-            st.dataframe(pd.DataFrame(grid_data), hide_index=True, use_container_width=True)
-            st.error(
-                "**Grid integration is dead on arrival for any real model.** "
-                "A modest Bayesian neural network has thousands of parameters; "
-                "a hierarchical regression has dozens. There aren't enough atoms "
-                "in the universe to grid-evaluate either."
-            )
-            st.markdown("""
-So we need a way to **work with the posterior without ever computing Z.**
-Two main approaches in modern Bayesian computation:
-
-- **Variational inference (VI).** Approximate p(θ | y) with a simpler family
-  (often Gaussian) and optimise. Fast — feels like training a neural net —
-  but the answer is biased by whatever family you chose.
-- **Markov Chain Monte Carlo (MCMC).** Sample from the posterior directly,
-  using only pointwise evaluations of p(y|θ)·p(θ). **Exact in the limit**,
-  no closed form needed. ← *this talk*
-""")
-
-        with col_r:
-            st.markdown("### Curse of dimensionality — all the mass is in a shell")
-
-            from scipy.special import gamma as _gamma_fn
-            dims_cod = np.arange(1, 35)
-            # Volume of d-ball as fraction of bounding d-cube
-            ball_frac = (np.pi ** (dims_cod / 2.0)
-                         / (_gamma_fn(dims_cod / 2.0 + 1) * 2.0 ** dims_cod))
-            ball_frac = np.clip(ball_frac, 1e-300, 1.0)
-
-            fig_cod2 = go.Figure()
-            fig_cod2.add_trace(go.Scatter(
-                x=dims_cod, y=ball_frac * 100.0,
-                mode="lines+markers",
-                line=dict(color=C_RED, width=2.5),
-                marker=dict(size=5),
-                name="% of cube volume in inscribed ball",
-            ))
-            fig_cod2.update_layout(
-                title="In high dimensions, the cube is almost all corners",
-                xaxis_title="Number of dimensions D",
-                yaxis_title="% of cube volume in inscribed ball",
-                yaxis=dict(type="log"),
-                height=240, margin=dict(t=50, b=30),
-            )
-            st.plotly_chart(fig_cod2, use_container_width=True)
-
-            st.markdown("""
-In 10D, less than 0.25 % of the bounding box has any posterior mass inside it.
-A uniform grid wastes 99.75 % of its evaluations.
-The posterior mass lives on a thin **typical set** — a shell that grid methods
-cannot find efficiently but MCMC navigates naturally.
-
----
-
-### The key insight: Z cancels in MCMC
-
-In the Metropolis acceptance step we take the *ratio* of posteriors:
-""")
-            st.latex(r"""
-\alpha
-= \min\!\left(1,\;\frac{p(\theta^* \mid y)}{p(\theta \mid y)}\right)
-= \min\!\left(1,\;
-  \frac{p(y \mid \theta^*)\,p(\theta^*)}{p(y \mid \theta)\,p(\theta)}
-  \cdot\cancel{\frac{Z}{Z}}
-\right)
-""")
-            st.success(
-                "**Z cancels exactly.**  "
-                "MCMC only needs the unnormalised product p(y|θ)·p(θ) — "
-                "evaluated at two points.  No integrals, no Z."
-            )
-
-    # ── Step 4: MCMC to the rescue ─────────────────────────────────────────────
-    elif ov_step == 4:
-        st.markdown("## MCMC: exploring the posterior without Z")
+            fig_d = go.Figure()
+            fig_d.add_trace(go.Contour(
+                x=gx, y=gy, z=GZ, showscale=False,
+                colorscale="Blues", opacity=0.55,
+                contours=dict(showlines=False)))
+            fig_d.add_trace(go.Scatter(
+                x=chain_x, y=chain_y, mode="lines",
+                line=dict(color="rgba(99,110,250,0.55)", width=1),
+                showlegend=False))
+            fig_d.add_trace(go.Scatter(
+                x=[chain_x[-1]], y=[chain_y[-1]], mode="markers",
+                marker=dict(size=10, color=C_RED,
+                            line=dict(color="white", width=1)),
+                name="current state", showlegend=False))
+            fig_d.update_layout(
+                xaxis_title="θ₁", yaxis_title="θ₂",
+                title=f"After {n_steps_demo} steps",
+                height=380, margin=dict(t=50, b=40))
+            st.plotly_chart(fig_d, use_container_width=True)
 
         st.markdown("""
-**Big idea.** Instead of trying to *write down* p(θ | y), draw a long sequence
-of **samples** from it. A histogram of those samples *is* the posterior, for any
-practical purpose: means, intervals, predictions, expected utilities — all become
-averages over samples.
+**The plan for the rest of this talk.**
 
-**How.** Build a random walk over parameter space whose long-run visit frequency
-is exactly p(θ | y). The walk is a *Markov chain* (next state depends only on
-the current state). Run it long enough → samples from the posterior.
-
-**The magic step.** The walk only ever needs the **ratio** of posteriors at two
-points. In that ratio, the unknown Z cancels:
+1. **Metropolis–Hastings** — the simplest possible chain.
+2. **Hamiltonian Monte Carlo** — a much smarter chain that uses gradients.
+3. **Comparison** — when each one wins.
+4. **Build a PPL from scratch** — wrap distributions and a sampler into a
+   tiny library, the way Stan and PyMC are structured.
+5. **Wildflower phenology** — point that machinery at the problem we just
+   set up, and read off honest uncertainty in plain English.
 """)
-        st.latex(r"""
-\frac{p(\theta^{*} \mid y)}{p(\theta \mid y)}
-= \frac{p(y\mid\theta^{*})\,p(\theta^{*})\,/\,Z}{p(y\mid\theta)\,p(\theta)\,/\,Z}
-= \frac{p(y\mid\theta^{*})\,p(\theta^{*})}{p(y\mid\theta)\,p(\theta)}
-""")
-        st.markdown("""
-That's the trick the rest of this app unpacks. We only ever need to evaluate
-the *unnormalised* posterior p̃(θ) = p(y|θ)·p(θ) — likelihood × prior —
-something we always know how to compute.
-""")
+        st.info("Continue to the **Metropolis-Hastings** tab when ready.")
 
-        col_l, col_r = st.columns([1, 1])
-
-        with col_l:
-            st.markdown("""#### Metropolis-Hastings (Metropolis et al., 1953)
-
-Invented for nuclear-weapons simulations at Los Alamos.
-From the current position θ:
-
-1. **Propose** θ* ~ N(θ, σ²) &nbsp; *(random Gaussian step)*
-2. Compute **acceptance ratio** α = min(1, p̃(θ*) / p̃(θ))
-3. Accept θ* with probability α; otherwise stay at θ
-
-The chain drifts toward high-probability regions because uphill moves always
-accept; downhill moves accept with a probability proportional to the density
-drop, so the chain never gets permanently trapped.
-
-**Drawback:** moves like a random walk.  To travel distance d the chain needs
-O(d²) steps — slow in high dimensions.
-""")
-            st.info("→ **Metropolis-Hastings tab** — step-by-step walkthrough with live visualisations")
-
-        with col_r:
-            st.markdown("""#### Hamiltonian Monte Carlo (Duane et al., 1987)
-
-Invented for lattice QCD simulations.  Add an auxiliary **momentum** p ~ N(0, I)
-and define the Hamiltonian:
-""")
-            st.latex(r"H(\theta, p) = \underbrace{-\log \tilde{p}(\theta \mid y)}_{U(\theta)\ \text{potential}} + \underbrace{\tfrac{1}{2}p^\top p}_{K(p)\ \text{kinetic}}")
-            st.markdown("""
-Run **leapfrog integration** (a symplectic ODE solver) for L steps at step size ε.
-The leapfrog trajectory follows constant-H surfaces, so the proposal lands *far*
-from the start without the random-walk diffusion of MH.
-
-Accept/reject on ΔH to correct for discretisation error.
-
-**Requires:** ∇_θ log p̃(θ|y) — the gradient, computed by automatic differentiation
-in PyMC / Stan / NumPyro.
-""")
-            st.info("→ **HMC & Leapfrog tab** — leapfrog integrator + phase portrait visualisations")
-
-        st.divider()
-        st.markdown("### At a glance")
-        st.markdown("""
-| | **Metropolis-Hastings** | **Hamiltonian Monte Carlo** |
-|---|---|---|
-| **Year / origin** | 1953 — nuclear physics | 1987 — lattice QCD |
-| **Proposal** | Random Gaussian jump | Gradient-guided leapfrog trajectory |
-| **Needs** | log p̃(θ) only | log p̃(θ) + **gradient** ∇ log p̃(θ) |
-| **Mixing speed** | Slow — random walk O(d²) | Fast — O(d^{5/4}) steps |
-| **Acceptance rate** | Target ~23–50 % | Target ~60–90 % |
-| **Tuning knobs** | Proposal width σ | Step size ε, leapfrog steps L |
-| **Used in** | Teaching, non-differentiable models | PyMC, Stan, NumPyro, Pyro |
-
-Use the tabs above to step through each algorithm interactively,
-then compare them head-to-head in the **Comparison** tab.
-""")
-        st.info("""
-**Reading MCMC diagnostics** — used throughout the rest of this app
-
-| Plot | What "good" looks like |
-|---|---|
-| **Trace plot** | Noisy, no trend, no long flat stretches |
-| **Histogram** | Smooth, matches the target density |
-| **ACF** | Drops quickly toward zero |
-| **Acceptance rate** | MH: 20–50 % · HMC: 60–90 % |
-""")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # METROPOLIS-HASTINGS TAB
